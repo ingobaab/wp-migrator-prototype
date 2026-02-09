@@ -196,192 +196,362 @@ $progress_update_after_files_processed = 100;  // 1 shows all files
  */
 $allUnknownExtensions = [];
 
+
 /**
- * Implements a PHP stream filter for AES-256-CBC encryption and decryption.
- *
- * This class provides a custom stream filter for encrypting or decrypting data using AES-256 in CBC mode,
- * with password-based key derivation (PBKDF2) and HMAC authentication.
- *
- * The filter can be used in stream operations via `stream_filter_append()` and `stream_filter_register()`,
- * and supports the modes "encrypt" and "decrypt". It expects a password to be provided via the `params` array.
- *
- * Encryption mode:
- * - Generates a random salt and IV.
- * - Derives a 256-bit key using PBKDF2 with SHA-256.
- * - Produces HMAC to ensure integrity.
- * - Output format: [salt][IV][HMAC][ciphertext]
- *
- * Decryption mode:
- * - Extracts salt, IV, and HMAC from the input.
- * - Derives the key using PBKDF2.
- * - Verifies the HMAC.
- * - Decrypts the ciphertext if integrity is confirmed.
- *
- * @see stream_filter_register()
- * @see stream_filter_append()
- *
- * @property string $mode      The mode of operation: 'encrypt' or 'decrypt'.
- * @property string $buffer    Buffered stream data to be processed.
- * @property string $password  Password used for key derivation.
- * @property string $key       Derived encryption/decryption key.
- * @property string $iv        Initialization vector for AES-CBC.
- * @property string $salt      Salt used for PBKDF2.
- * @property string $hmac      HMAC used for integrity verification.
+ * Interface for progress reporting during long-running operations.
+ * 
+ * This interface allows different implementations for CLI output, 
+ * AJAX/WebGUI updates, or silent operation during testing.
  */
+interface ProgressHandler {
+    /**
+     * Update progress with current state.
+     * 
+     * @param int $current Current progress value (e.g., rows processed, files processed)
+     * @param int $total Total expected value
+     * @param string $message Optional status message
+     * @return void
+     */
+    public function update(int $current, int $total, string $message = ''): void;
+    
+    /**
+     * Signal that the operation has finished.
+     * 
+     * @param array $stats Final statistics (e.g., total time, items processed)
+     * @return void
+     */
+    public function finish(array $stats = []): void;
+}
+
+
+/**
+ * Progress handler for command-line interface with formatted progress bar.
+ * 
+ * Supports three verbosity levels:
+ * - 0: Single self-overwriting line with progress bar, percentage, and ETA
+ * - 1: Progress bar + periodic status updates (~20 lines)
+ * - 2+: Detailed output showing every record/file processed
+ */
+class CliProgressHandler implements ProgressHandler {
+    private int $verbosity;
+    private float $start_time;
+    private int $last_current = 0;
+    private float $last_update_time = 0;
+    private int $update_counter = 0;
+    private bool $finished = false;
+    
+    /**
+     * @param int $verbosity Verbosity level (0=minimal, 1=normal, 2+=verbose)
+     */
+    public function __construct(int $verbosity = 0) {
+        $this->verbosity = $verbosity;
+        $this->start_time = microtime(true);
+        $this->last_update_time = $this->start_time;
+    }
+    
+    public function update(int $current, int $total, string $message = ''): void {
+        if ($this->finished) return;
+        
+        $now = microtime(true);
+        $this->update_counter++;
+        
+        // Calculate progress
+        $percent = ($total > 0) ? ($current / $total * 100) : 0;
+        $elapsed = $now - $this->start_time;
+        $eta = $this->calculateETA($current, $total, $elapsed);
+        
+        // Verbosity level 2+: Show every item
+        if ($this->verbosity >= 2) {
+            if ($message) {
+                echo sprintf("[%d/%d] %s\n", $current, $total, $message);
+            }
+            return;
+        }
+        
+        // Verbosity level 1: Show updates every ~100 items or every 2 seconds
+        if ($this->verbosity === 1) {
+            if ($this->update_counter % 100 === 0 || ($now - $this->last_update_time) >= 2.0) {
+                $bar = $this->renderProgressBar($percent, 30);
+                echo sprintf("\r%s %6.1f%% | %s | ETA: %s | Elapsed: %s", 
+                    $bar, $percent, $message ?: 'Processing', $eta, $this->formatTime($elapsed));
+                $this->last_update_time = $now;
+            }
+            return;
+        }
+        
+        // Verbosity level 0: Single self-overwriting line, update every 0.5 seconds
+        if (($now - $this->last_update_time) >= 0.5 || $current === $total) {
+            $bar = $this->renderProgressBar($percent, 40);
+            echo sprintf("\r%s %6.1f%% (%d/%d) ETA: %s", 
+                $bar, $percent, $current, $total, $eta);
+            $this->last_update_time = $now;
+        }
+        
+        $this->last_current = $current;
+    }
+    
+    public function finish(array $stats = []): void {
+        if ($this->finished) return;
+        $this->finished = true;
+        
+        $elapsed = microtime(true) - $this->start_time;
+        
+        if ($this->verbosity === 0) {
+            // Complete the progress bar line
+            $bar = $this->renderProgressBar(100, 40);
+            echo sprintf("\r%s 100.0%% (%s)\n", $bar, $this->formatTime($elapsed));
+        } elseif ($this->verbosity === 1) {
+            echo sprintf("\n✓ Completed in %s\n", $this->formatTime($elapsed));
+        } else {
+            echo sprintf("\n✓ Completed in %s", $this->formatTime($elapsed));
+            if (!empty($stats)) {
+                echo " - Stats: " . json_encode($stats);
+            }
+            echo "\n";
+        }
+    }
+    
+    /**
+     * Render a text-based progress bar.
+     * 
+     * @param float $percent Percentage complete (0-100)
+     * @param int $width Width of the progress bar in characters
+     * @return string Formatted progress bar
+     */
+    private function renderProgressBar(float $percent, int $width = 40): string {
+        $filled = (int)($width * $percent / 100);
+        $empty = $width - $filled;
+        return '[' . str_repeat('=', $filled) . str_repeat(' ', $empty) . ']';
+    }
+    
+    /**
+     * Calculate estimated time remaining.
+     * 
+     * @param int $current Current progress
+     * @param int $total Total expected
+     * @param float $elapsed Time elapsed in seconds
+     * @return string Formatted ETA string
+     */
+    private function calculateETA(int $current, int $total, float $elapsed): string {
+        if ($current === 0 || $total === 0) {
+            return '--:--';
+        }
+        
+        $rate = $current / $elapsed;
+        $remaining = $total - $current;
+        $eta_seconds = ($rate > 0) ? ($remaining / $rate) : 0;
+        
+        return $this->formatTime($eta_seconds);
+    }
+    
+    /**
+     * Format time duration in human-readable format.
+     * 
+     * @param float $seconds Time in seconds
+     * @return string Formatted time string
+     */
+    private function formatTime(float $seconds): string {
+        if ($seconds < 60) {
+            return sprintf('%ds', (int)$seconds);
+        } elseif ($seconds < 3600) {
+            return sprintf('%dm %ds', (int)($seconds / 60), (int)($seconds % 60));
+        } else {
+            $hours = (int)($seconds / 3600);
+            $minutes = (int)(($seconds % 3600) / 60);
+            return sprintf('%dh %dm', $hours, $minutes);
+        }
+    }
+}
+
+
+/**
+ * Progress handler for AJAX/WebGUI that writes progress to a JSON file.
+ * 
+ * The WebGUI can poll this file to update a progress bar in the browser.
+ */
+class AjaxProgressHandler implements ProgressHandler {
+    private string $progress_file;
+    private float $start_time;
+    private int $last_written = 0;
+    
+    /**
+     * @param string $progress_file Path to JSON file for progress updates
+     */
+    public function __construct(string $progress_file) {
+        $this->progress_file = $progress_file;
+        $this->start_time = microtime(true);
+        
+        // Initialize progress file
+        $this->writeProgress([
+            'status' => 'started',
+            'percent' => 0,
+            'current' => 0,
+            'total' => 0,
+            'message' => 'Starting...',
+            'start_time' => $this->start_time
+        ]);
+    }
+    
+    public function update(int $current, int $total, string $message = ''): void {
+        $now = microtime(true);
+        $elapsed = $now - $this->start_time;
+        $percent = ($total > 0) ? ($current / $total * 100) : 0;
+        
+        // Write update every 100 items or if more than 1 second has passed
+        if (($current - $this->last_written) >= 100 || ($current === $total) || $elapsed < 1) {
+            $this->writeProgress([
+                'status' => 'running',
+                'percent' => round($percent, 1),
+                'current' => $current,
+                'total' => $total,
+                'message' => $message ?: 'Processing...',
+                'elapsed' => round($elapsed, 1),
+                'timestamp' => $now
+            ]);
+            $this->last_written = $current;
+        }
+    }
+    
+    public function finish(array $stats = []): void {
+        $elapsed = microtime(true) - $this->start_time;
+        $this->writeProgress([
+            'status' => 'completed',
+            'percent' => 100,
+            'message' => 'Completed',
+            'elapsed' => round($elapsed, 1),
+            'stats' => $stats,
+            'timestamp' => microtime(true)
+        ]);
+    }
+    
+    /**
+     * Write progress data to JSON file.
+     * 
+     * @param array $data Progress data to write
+     */
+    private function writeProgress(array $data): void {
+        $json = json_encode($data, JSON_PRETTY_PRINT) . "\n";
+        @file_put_contents($this->progress_file, $json, LOCK_EX);
+    }
+}
+
+
+/**
+ * Silent progress handler for testing or batch operations.
+ * 
+ * Does not produce any output.
+ */
+class SilentProgressHandler implements ProgressHandler {
+    public function update(int $current, int $total, string $message = ''): void {
+        // Silent - no output
+    }
+    
+    public function finish(array $stats = []): void {
+        // Silent - no output
+    }
+}
+
+
 class AES256StreamFilter extends php_user_filter
 {
-    private const SALT_LEN = 16;
-    private const IV_LEN = 16;
-    private const KEY_LEN = 32;
-    private const HMAC_LEN = 32;
+    private const SALT_SIZE = 16;
+    private const IV_SIZE = 16;
+    private const KEY_SIZE = 32;
+    private const PBKDF2_ITERATIONS = 100000;
 
-    private $mode;
-    private $buffer = '';
-    private $password;
-    private $key;
-    private $iv;
-    private $salt;
-    private $hmac;
+    private string $mode;
+    private string $password;
+    private bool $compress;
+    private string $buffer = '';
+    private string $key = '';
+    private string $iv = '';
+    private string $salt = '';
+    private bool $initialized = false;
+    private $zlib_context;
 
     public function onCreate(): bool
     {
-        $this->mode = $this->params['mode'] ?? 'encrypt';
-        $this->password = $this->params['password'] ?? null;
+        $params = $this->params ?? [];
+        $this->mode = $params['mode'] ?? 'encrypt';
+        $this->password = $params['password'] ?? '';
+        $this->compress = $params['compress'] ?? false;
 
-        if (!$this->password) {
-            trigger_error("No password provided", E_USER_WARNING);
-
+        if (!$this->password || !in_array($this->mode, ['encrypt', 'decrypt'])) {
+            trigger_error("AES256StreamFilter: Missing password or invalid mode", E_USER_WARNING);
             return false;
-        }
-
-        if ($this->mode === 'encrypt') {
-            $this->salt = random_bytes(self::SALT_LEN);
-            $this->iv = random_bytes(self::IV_LEN);
-            $this->key = hash_pbkdf2('sha256', $this->password, $this->salt, 100000, self::KEY_LEN, true);
         }
 
         return true;
     }
 
-    public function filter($in, $out, &$consumed, $closing):int
+    public function filter($in, $out, &$consumed, $closing): int
     {
         while ($bucket = stream_bucket_make_writeable($in)) {
             $this->buffer .= $bucket->data;
-            $consumed += strlen($bucket->data);
+            $consumed += $bucket->datalen;
         }
 
-        if (!$closing) return PSFS_FEED_ME;
-
-        if ($this->mode === 'encrypt') {
-            $encrypted = openssl_encrypt($this->buffer, 'aes-256-cbc', $this->key, OPENSSL_RAW_DATA, $this->iv);
-            $hmac = hash_hmac('sha256', $encrypted, $this->key, true);
-            $final = $this->salt . $this->iv . $hmac . $encrypted;
-        } else {
-            if (strlen($this->buffer) < self::SALT_LEN + self::IV_LEN + self::HMAC_LEN) {
-                trigger_error("Data missing in encrypted data (SALT, IV, HMAC). Exit 1. ");
-                exit(1);
-            }
-
-            $this->salt = substr($this->buffer, 0, self::SALT_LEN);
-            $this->iv = substr($this->buffer, self::SALT_LEN, self::IV_LEN);
-            $this->hmac = substr($this->buffer, self::SALT_LEN + self::IV_LEN, self::HMAC_LEN);
-            $ciphertext = substr($this->buffer, self::SALT_LEN + self::IV_LEN + self::HMAC_LEN);
-
-            $this->key = hash_pbkdf2('sha256', $this->password, $this->salt, 100000, self::KEY_LEN, true);
-            $calcHmac = hash_hmac('sha256', $ciphertext, $this->key, true);
-
-            if (!hash_equals($this->hmac, $calcHmac)) {
-                trigger_error("Incorrect password or corrupted file. Exit 1. ");
-                exit(1);
-            }
-
-            $final = openssl_decrypt($ciphertext, 'aes-256-cbc', $this->key, OPENSSL_RAW_DATA, $this->iv);
+        if (!$closing) {
+            return PSFS_FEED_ME;
         }
 
-        $bucket = stream_bucket_new($this->stream, $final);
-        stream_bucket_append($out, $bucket);
+        if (!$this->initialized) {
+            if ($this->mode === 'encrypt') {
+                $this->salt = random_bytes(self::SALT_SIZE);
+                $this->iv = random_bytes(self::IV_SIZE);
+                $this->key = $this->deriveKey($this->password, $this->salt);
+                $this->initialized = true;
+
+                if ($this->compress) {
+                    $this->zlib_context = deflate_init(ZLIB_ENCODING_GZIP, ['level' => 6]);
+                    $this->buffer = deflate_add($this->zlib_context, $this->buffer, ZLIB_FINISH);
+                }
+
+                $encrypted = openssl_encrypt($this->buffer, 'aes-256-cbc', $this->key, OPENSSL_RAW_DATA, $this->iv);
+                if ($encrypted === false) {
+                    trigger_error("AES256StreamFilter: Encryption failed", E_USER_WARNING);
+                    return PSFS_ERR_FATAL;
+                }
+
+                $bucket = stream_bucket_new($this->stream, $this->salt . $this->iv . $encrypted);
+                stream_bucket_append($out, $bucket);
+            } else {
+                if (strlen($this->buffer) < self::SALT_SIZE + self::IV_SIZE) {
+                    trigger_error("AES256StreamFilter: Encrypted data too short", E_USER_WARNING);
+                    return PSFS_ERR_FATAL;
+                }
+
+                $this->salt = substr($this->buffer, 0, self::SALT_SIZE);
+                $this->iv   = substr($this->buffer, self::SALT_SIZE, self::IV_SIZE);
+                $ciphertext = substr($this->buffer, self::SALT_SIZE + self::IV_SIZE);
+                $this->key = $this->deriveKey($this->password, $this->salt);
+                $this->initialized = true;
+
+                $decrypted = openssl_decrypt($ciphertext, 'aes-256-cbc', $this->key, OPENSSL_RAW_DATA, $this->iv);
+                if ($decrypted === false) {
+                    trigger_error("AES256StreamFilter: Decryption failed", E_USER_WARNING);
+                    return PSFS_ERR_FATAL;
+                }
+
+                if ($this->compress) {
+                    $this->zlib_context = inflate_init(ZLIB_ENCODING_GZIP);
+                    $decrypted = inflate_add($this->zlib_context, $decrypted, ZLIB_FINISH);
+                }
+
+                $bucket = stream_bucket_new($this->stream, $decrypted);
+                stream_bucket_append($out, $bucket);
+            }
+        }
 
         return PSFS_PASS_ON;
     }
-}
 
-
-/**
- * Encrypts a file using AES-256 encryption.
- *
- * This function opens the specified input file (`$inFile`) for reading and the output file (`$outFile`)
- * for writing. It then applies the AES-256 encryption filter to the output stream and writes the data
- * from the input file to the output file, encrypting it using the provided password.
- *
- * @param string $inFile The path to the input file to be encrypted.
- * @param string $outFile The path to the output file where the encrypted data will be saved.
- * @param string $password The password used for encryption.
- * @return bool Returns `true` if the file was successfully encrypted, `false` otherwise.
- */
-function encryptFile(string $inFile, string $outFile, string $password): bool
-{
-    $in = fopen($inFile, 'rb');
-    $out = fopen($outFile, 'wb');
-
-    stream_filter_append($out, 'aes256', STREAM_FILTER_WRITE, [
-        'mode' => 'encrypt',
-        'password' => $password
-    ]);
-
-    while (!feof($in)) {
-        fwrite($out, fread($in, 8192));
+    private function deriveKey(string $password, string $salt): string
+    {
+        return hash_pbkdf2('sha256', $password, $salt, self::PBKDF2_ITERATIONS, self::KEY_SIZE, true);
     }
-
-    fclose($in);
-    fclose($out);
-
-    return true;
 }
 
-
-/**
- * Decrypts a file using AES-256 decryption.
- *
- * This function opens the specified input file (`$inFile`) for reading and the output file (`$outFile`)
- * for writing. It then applies the AES-256 decryption filter to the input stream and writes the decrypted
- * data to the output file. The provided password is used for decryption.
- * If any error occurs during reading the input file, the output file is deleted and the function returns `false`.
- *
- * @param string $inFile The path to the input file to be decrypted.
- * @param string $outFile The path to the output file where the decrypted data will be saved.
- * @param string $password The password used for decryption.
- * @return bool Returns `true` if the file was successfully decrypted, `false` otherwise.
- */
-function decryptFile(string $inFile, string $outFile, string $password): bool
-{
-    $in = fopen($inFile, 'rb');
-    $out = fopen($outFile, 'wb');
-
-    stream_filter_append($in, 'aes256', STREAM_FILTER_READ, [
-        'mode' => 'decrypt',
-        'password' => $password
-    ]);
-
-    try {
-        while (!feof($in)) {
-            $data = fread($in, 8192);
-            if ($data === false) {
-                throw new RuntimeException("Reading error.");
-            }
-            fwrite($out, $data);
-        }
-    } catch (\Throwable $e) {
-        fclose($in);
-        fclose($out);
-        unlink($outFile);
-        return false;
-    }
-
-    fclose($in);
-    fclose($out);
-
-    return true;
-}
 
 
 /**
@@ -392,7 +562,7 @@ function decryptFile(string $inFile, string $outFile, string $password): bool
  *
  * @return string The Sigma symbol, either as Unicode or HTML entity.
  */
-function sigma() {
+function sigma(): string {
     if (PHP_SAPI === 'cli') {
       return "\u{03A3}";
     } else {
@@ -402,6 +572,127 @@ function sigma() {
 
 
 /**
+ * Checks if a shell command is available.
+ *
+ * @param string $cmd The command to check.
+ * @return string|false Path to the command if available, false otherwise.
+ */
+function is_cmd_available( $cmd ) {
+    if ( ! is_shell_exec_enabled() ) {
+        return false;
+    } else {
+        return shell_exec( 'command -v ' . escapeshellarg( $cmd ) . ' 2>/dev/null' );
+    }
+}
+
+
+/**
+ * Returns the full path to a shell command or a fallback message.
+*
+* @param string $cmd The command to locate.
+* @return string Command path or a "not available" message.
+*/
+function path_of_cmd( $cmd ): string {
+
+    $path_of_cmd = is_cmd_available( $cmd );
+
+    if ( $path_of_cmd ) {
+        return trim( $path_of_cmd );
+    } else {
+        return __( 'not available', 'wpzip' );
+    }
+}
+
+
+/**
+ * Check if PDO MySQL driver is available.
+ *
+ * This function checks if the PDO extension is available and if the MySQL
+ * driver is listed among the available PDO drivers.
+ *
+ * @return bool True if PDO MySQL driver is available, false otherwise.
+ */
+function is_pdo_mysql_available(): bool {
+    return class_exists( 'PDO' ) && in_array( 'mysql', PDO::getAvailableDrivers(), true );
+}
+
+
+/**
+ * Custom gettext filter for handling translations in the 'wpzip' domain.
+ *
+ * This function provides basic translations for the 'wpzip' domain. It maps
+ * string translations manually in an array and returns the translated string
+ * based on the current locale. This approach enables translation handling
+ * without relying on external `.PO` and `.MO` files, although these files
+ * can be used for full localization later.
+ *
+ * Example:
+ * - __('Hello, world!', 'wpzip') will return 'Hallo, Welt!' in German (de_DE)
+ * - __('Goodbye!', 'wpzip') will return 'Auf Wiedersehen!' in German (de_DE)
+ *
+ * You can integrate `.PO` and `.MO` files later to replace the hardcoded translations.
+ *
+ * @param string $translated The translated string.
+ * @param string $original The original string before translation.
+ * @param string $domain The text domain. Only processes strings in 'wpzip'.
+ * @return string The translated string, or the original if no translation is found.
+ */
+$wpzip_translations = [
+    'Hello, WPZip!' => [
+        'de_DE' => 'Hallo, WPZip!',
+        'fr_FR' => 'Bonjour, WPZip!',
+    ],
+    'Goodbye!' => [
+        'de_DE' => 'Auf Wiedersehen!',
+        'fr_FR' => 'À revoir!',
+    ],
+    'Yes' => [
+        'de_DE' => 'Ja',
+        'fr_FR' => 'Qui',
+        'es_ES' => 'Si',
+    ],
+    'No' => [
+        'de_DE' => 'Nein',
+        'fr_FR' => 'Non',
+        'es_ED' => 'No',
+    ],
+    'available' => [
+        'de_DE' => 'verfügbar',
+        'fr_FR' => 'disponible',
+        'es_ES' => 'disponible',
+    ],
+    'not available' => [
+        'de_DE' => 'nicht verfügbar',
+        'fr_FR' => 'pas disponible',
+        'es_ES' => 'no disponible',
+    ]
+];
+
+if (is_wp_loaded()) {
+    add_filter('gettext', function($translated, $original, $domain) {
+        // Check if the domain is 'wpzip' to apply our custom translations
+        if ($domain !== 'wpzip') {
+            return $translated;
+        }
+
+        global $wpzip_translations;
+
+        // Determine the current locale
+        $locale = determine_locale();
+
+        // Return the translated string if available for the current locale
+        if (isset($wpzip_translations[$original][$locale])) {
+            return $wpzip_translations[$original][$locale];
+        }
+
+        // If no translation is found, return the original string
+        return $translated;
+    }, 10, 3);
+} else {
+    // TODO: Custom Translator-Function for CLI, not needed yet.
+}
+
+/**
  * Checks if the `shell_exec` function is enabled and available.
  *
  * This function checks whether `shell_exec` is not disabled in the PHP configuration
@@ -409,7 +700,7 @@ function sigma() {
  *
  * @return bool Returns `true` if `shell_exec` is enabled and available, otherwise `false`.
  */
-function isShellExecEnabled(): bool {
+function is_shell_exec_enabled(): bool {
     $disabledFunctions = explode(',', ini_get('disable_functions'));
 
     return function_exists('shell_exec') && !in_array('shell_exec', $disabledFunctions, true);
@@ -425,8 +716,8 @@ function isShellExecEnabled(): bool {
  *
  * @return bool Returns `true` if `mysqldump` is available, otherwise `false`.
  */
-function isMysqldumpAvailable(): bool {
-    if (!isShellExecEnabled()) {
+function is_mysqldump_available(): bool {
+    if (!is_shell_exec_enabled()) {
         return false;
     }
     $mysqldumpPath = trim(shell_exec('command -v mysqldump 2>/dev/null'));
@@ -453,7 +744,7 @@ function isMysqldumpAvailable(): bool {
  * @param string $httpdRoot The web root directory to check (default: '/htdocs').
  * @return int The total size of the directory in bytes.
  */
-function getWebserverRootDirectorySize($httpdRoot = '/htdocs') {
+function _1_old_2_getWebserverRootDirectorySize($httpdRoot = '/htdocs') {
     // Step 1: Check if shell_exec() is available
     function shellExecAvailable() {
         if (!function_exists('shell_exec')) return false;
@@ -608,66 +899,106 @@ $excludedPaths = [];
  * @global int $totalDirs Counts total processed directories
  * @throws RuntimeException If directory cannot be read
  */
-function calculateTotals($directory) {
-  global $verb, $totalDirs, $totalFiles, $totalSize, $excludedPaths, $archiveFile;
+function calculateTotals($directory, $log_file = null, $log_mode = 'text') {
+    global $verb, $totalDirs, $totalFiles, $totalSize, $excludedPaths, $archiveFile;
 
-  $iterator = new RecursiveIteratorIterator(
-      new RecursiveDirectoryIterator($directory, RecursiveDirectoryIterator::SKIP_DOTS),
-      RecursiveIteratorIterator::SELF_FIRST
-  );
+    $iterator = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($directory, RecursiveDirectoryIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::SELF_FIRST
+    );
 
-  foreach ($iterator as $file) {
-      $currentPath = $file->getPathname();
+    // Logging-Callback vorbereiten
+    $log = function ($type, $message, $context = []) use ($log_file, $log_mode) {
+        $entry = [
+            'time' => date('c'),
+            'type' => strtoupper($type),
+            'message' => $message,
+        ];
+        if (!empty($context)) {
+            $entry['context'] = $context;
+        }
 
-      // Check if current path is in excluded paths
-      $excluded = false;
-      foreach ($excludedPaths as $excludedPath) {
-          if (strpos($currentPath, $excludedPath) === 0) {
-              $excluded = true;
-              break;
-          }
-      }
-      if ($excluded) {
-          continue;
-      }
+        if ($log_mode === 'json') {
+            $line = json_encode($entry, JSON_UNESCAPED_SLASHES) . "\n";
+        } else {
+            $line = "[" . $entry['time'] . "] [" . $entry['type'] . "] " . $entry['message'] . "\n";
+        }
 
-      // Check for .zipignore in directories
-      if ($file->isDir()) {
-          if (file_exists($file->getPathname() . '/.zipignore')) {
-              $excludedPaths[] = $file->getPathname() . '/';
-              if ($verb>=4) echo "\n[EXCLUDED] " . $file->getPathname() . " (found .zipignore)";
-              continue;
-          }
-      }
-      $i = $totalFiles + $totalDirs + 1;
+        if ($log_file) {
+            file_put_contents($log_file, $line, FILE_APPEND);
+        } else {
+            echo $line;
+        }
+    };
 
-      if ($verb >= 0 and strpos($file->getPathname(), 'backup')
-                      or strpos($file->getPathname(), 'backwpup')) {
-          echo "\n" . $i . "[ 'backup' found ] " . $file->getPathname();
-      }
+    try {
+        foreach ($iterator as $file) {
+            $current_path = $file->getPathname();
 
-      # if (realpath($archiveFile) === realpath($file->getPathname()) /* && $file->isFile() */) {
-      #     if ($verb >= 1) { echo "\n" . $i . " [skipping arch itself] " . $file->getPathname(); }
-      #     continue;
-      # }
+            // Skip excluded paths
+            foreach ($excludedPaths as $excludedPath) {
+                if (strpos($current_path, $excludedPath) === 0) {
+                    continue 2;
+                }
+            }
 
-      // Calculate size only for non-excluded items
-      $headersize = 1 + 4 + 2 + 16; // C + N + n + checksum
+            // Skip directories with .zipignore
+            if ($file->isDir() && file_exists($current_path . '/.zipignore')) {
+                $excludedPaths[] = $current_path . '/';
+                if ($verb >= 4) {
+                    $log('excluded', "$current_path (found .zipignore)");
+                }
+                continue;
+            }
 
-      $totalSize += $file->getSize() + strlen($file->getPath()) + $headersize;
+            // Warn if 'backup' or 'backwpup' is found
+            if ($verb >= 0 && (strpos($current_path, 'backup') !== false || strpos($current_path, 'backwpup') !== false)) {
+                $log('match', "Found 'backup' in path", ['path' => $current_path]);
+            }
 
-      if ($file->isFile()) {
-          $totalFiles += 1;
-      } elseif ($file->isDir()) {
-          $totalDirs += 1;
-      }
-      if ($i % 300 === 0) {
-          if ($verb >= 3) echo sprintf( spinner() . " [%5d] %6d %6d %7d %s", $i, $totalFiles, $totalDirs, $totalSize, shorten($file->getPathname(),70,true) . "\r" );
-          if ($verb >= 4) echo "\n";
-      }
-  }
-  echo "\n";
-  return true;
+            // Optional: skip archive file itself
+            /*
+            if (realpath($archiveFile) === realpath($current_path)) {
+                $log('skip', "Skipping archive file itself", ['path' => $current_path]);
+                continue;
+            }
+            */
+
+            // Add to total size
+            $headersize = 1 + 4 + 2 + 16;
+            $totalSize += $file->getSize() + strlen($file->getPath()) + $headersize;
+
+            if ($file->isFile()) {
+                $totalFiles++;
+            } elseif ($file->isDir()) {
+                $totalDirs++;
+            }
+
+            $i = $totalFiles + $totalDirs;
+            if ($i % 1 === 0 && $verb >= 1) {
+                $log('progress', 'Progress update', [
+                    'index' => $i,
+                    'files' => $totalFiles,
+                    'dirs'  => $totalDirs,
+                    'size'  => $totalSize,
+                    'path'  => shorten($current_path, 70)
+                ]);
+            }
+        }
+    } catch (\Throwable $e) {
+        $log('error', 'Exception in calculateTotals(): ' . $e->getMessage(), [
+            'file' => $e->getFile(),
+            'line' => $e->getLine()
+        ]);
+        return false;
+    }
+
+    $log('done', 'Scan completed', [
+        'total_files' => $totalFiles,
+        'total_dirs'  => $totalDirs,
+        'total_size'  => $totalSize
+    ]);
+    return true;
 }
 
 
@@ -916,7 +1247,7 @@ function appendArchive($sourceDir, $outputFilename) {
         'mode' => 'encrypt',
         'password' => $password
         ])) {
-        throw new Exception("Can't append aes256.encrypt filter.");
+        throw new Exception("Can't append aes256 filter.");
     }
 
     $sourceDir = realpath($sourceDir);
@@ -1015,7 +1346,7 @@ function hexdump_decrypt($filename, $password, $filepos = 0, $length = 256): str
         'mode' => 'decrypt',
         'password' => $password
       ])) {
-        throw new Exception("Can't append aes256.decrypt filter.");
+        throw new Exception("Can't append aes256 filter.");
     }
 
     fseek($handle, $filepos);
@@ -1147,14 +1478,18 @@ function extractArchive($archiveFile, $outputDir, $offset = 0) {
           'mode' => 'decrypt',
           'password' => $password
        ])) {
-        throw new Exception("Can't append aes256.decrypt filter.");
+        throw new Exception("Can't append aes256 filter.");
     }
 
     fseek($stream, $offset);
     if (!$stream) throw new Exception("Can't read archive.");
 
-    if (!is_dir($outputDir)) mkdir($outputDir, 0777, true);
-    if (!is_dir($outputDir)) die("\nFATAL: Could not create '$outputDir'. Exit.\n\n");
+    if (!is_dir($outputDir)) {
+        if (!mkdir($outputDir, 0777, true)) {
+            die("Fehler: konnte Verzeichnis nicht erstellen: $outputDir");
+        }
+    }
+    if (!is_dir($outputDir)) die("\nFATAL: '$outputDir' is not a directory! Exit.\n\n");
 
     $processedFiles = 0;
     $processedDirs = 0;
@@ -1267,7 +1602,7 @@ function extractArchive($archiveFile, $outputDir, $offset = 0) {
         'mode' => 'decrypt',
         'password' => $password
      ])) {
-      throw new Exception("Can't append aes256.decrypt filter.");
+      throw new Exception("Can't append aes256 filter.");
     }
 
     $out = fopen($mysql_dump_file . '.decrypted', 'wb');
@@ -1356,6 +1691,52 @@ function prompt_visible_input($prompt = 'Passwort: ') {
 }
 
 
+
+
+/**
+ * Searches for the next wp-config.php file upwards in the directory tree.
+ *
+ * This function starts in the current directory and moves upwards in the directory
+ * structure until it finds a wp-config.php file or reaches the root directory.
+ *
+ * @param string $startDir The directory to start the search from. Defaults to the current directory.
+ *
+ * @return string|null The path to the wp-config.php file if found, or null if not found.
+ *
+ * @example
+ * $wpConfigPath = find_wp_config();
+ * if ($wpConfigPath) {
+ *     echo "Found wp-config.php at: $wpConfigPath";
+ * } else {
+ *     echo "wp-config.php not found!";
+ * }
+ */
+function find_wp_config(string $startDir = __DIR__): ?string {
+    // Start the search from the given directory
+    $dir = realpath($startDir);
+
+    // Traverse upwards in the directory tree
+    while ($dir !== false) {
+        $configPath = $dir . DIRECTORY_SEPARATOR . 'wp-config.php';
+
+        // Check if the wp-config.php file exists in the current directory
+        if (file_exists($configPath)) {
+            return $configPath; // Return the full path if found
+        }
+
+        // Move up one level in the directory tree
+        $dir = dirname($dir);
+
+        // Stop if we've reached the root directory
+        if ($dir === '/') {
+            break;
+        }
+    }
+
+    return null; // Return null if wp-config.php was not found
+}
+
+
 /**
  * Includes a sanitized version of the given wp-config.php file.
  *
@@ -1372,6 +1753,9 @@ function prompt_visible_input($prompt = 'Passwort: ') {
  * @return void
  */
 function include_sanitized_wp_config($wp_config_path) {
+
+    global $table_prefix;
+
     if (!file_exists($wp_config_path)) {
         throw new Exception("Datei nicht gefunden: $wp_config_path");
     }
@@ -1414,8 +1798,8 @@ function include_sanitized_wp_config($wp_config_path) {
     fclose($out);
 
     // temporäre Datei inkludieren
-    echo "include_once $tmp_file\n";
-    include_once $tmp_file;
+    // echo "include_once $tmp_file\n";
+    @ include_once $tmp_file;    // Don't show WARNINGS, multiple defines of WP_DEBUG or other garbage
 
     // temporäre Datei löschen
     // unlink($tmp_file);
@@ -1446,36 +1830,59 @@ function include_sanitized_wp_config($wp_config_path) {
  * } Associative array with WordPress database configuration values.
  */
 function getDbConfig($wpConfigPath) {
+
     global $table_prefix;
     static $config = null;
 
     if (is_array($config)) return $config;
 
-    if (! isset($table_prefix)) {                       // If global $table_prefix is set, we are in WP-Context. WordPress is loaded.
-        include_sanitized_wp_config($wpConfigPath);     // If not set, wie 'include stanitized' a tmp-wp-config.php copy without loading WP.
+    #if (! isset($table_prefix)) {                      // if global $table_prefix is set, we are in WP-Context. WordPress is loaded.
+    if (!is_wp_loaded()) {                              // if NOT is_wp_loaded(), otherwise everything is defined already.
+        include_sanitized_wp_config($wpConfigPath);     // if not set, wie 'include stanitized' a tmp-wp-config.php copy without loading WP.
     }
 
-    if (! defined('DB_NAME')) {                         // Now, in any case should DB_* credentials be defined. Inside WP and also from cmdline.
+    if (!defined('DB_HOST')) {
+        throw new RuntimeException('DB_HOST is not defined.');
+    }
 
-        fwrite(STDERR, "Error: Could not get DB Settings. Exit 1.\n");
-        exit(1);
+    $host   = 'localhost';
+    $port   = null;
+    $socket = null;
 
+    $db_host = DB_HOST;
+
+    if (strpos($db_host, ':') !== false) {
+        [$host_part, $second_part] = explode(':', $db_host, 2);
+
+        if (is_numeric($second_part)) {
+            $host = $host_part;
+            $port = (int)$second_part;
+        } elseif (str_starts_with($second_part, '/')) {
+            $host   = $host_part;
+            $socket = $second_part;
+        } else {
+            $host = $db_host; // fallback
+        }
     } else {
-
-        // fill the results array
-        $config['DB_NAME'] = DB_NAME;
-        $config['DB_USER'] = DB_USER;
-        $config['DB_PASSWORD'] = DB_PASSWORD;
-        $config['DB_HOST'] = DB_HOST;
-        $config['DB_CHARSET'] = DB_CHARSET;
-        $config['DB_COLLATE'] = DB_COLLATE;
-        $config['table_prefix'] = $table_prefix;
+        $host = $db_host;
     }
 
-    // Return results
+    // and return this results - array
+    $config = [
+        'host'    => $host,
+        'port'    => $port,
+        'socket'  => $socket,
+        'user'    => defined('DB_USER')     ? DB_USER     : null,
+        'pass'    => defined('DB_PASSWORD') ? DB_PASSWORD : null,
+        'name'    => defined('DB_NAME')     ? DB_NAME     : null,
+        'charset' => defined('DB_CHARSET')  ? DB_CHARSET  : 'utf8mb4',
+        'collate' => defined('DB_COLLATE')  ? DB_COLLATE  : ''
+    ];
+
     return $config;
 
 }
+
 
 
 function _old_getDbConfig($wpConfigPath) {
@@ -1565,9 +1972,9 @@ function getOptions() {
     if (isset($options["p"])) $password = $options["p"];
     if (isset($options["n"])) $progress_update_after_files_processed = $options["n"];
     if (isset($options["c"])) $gzipCompressionLevel = (int)$options["c"];
-    if (isset($options["V"]) or isset($options["version"])) die('Version: ' . printf_version() . "\n\n");
+    if (isset($options["V"]) or isset($options["version"])) die('Version: ' . $version . "\n\n");
     if (isset($options["u"]) or isset($options["update"])) {
-        echo "Updating " . basename(__FILE__) . " Version " . printf_version() . ' ';
+        echo "Updating " . basename(__FILE__) . " Version " . $version . ' ';
         $cmd='wget -q https://pre.a.wpexpress.de/wp-content/uploads/wpmove/src/wpack.php -O' . __FILE__;
         if ($verb >= 2) echo "updating with cmd: $cmd\n";
         shell_exec($cmd);
@@ -1860,15 +2267,14 @@ function mysql_dump() {
     global $verb, $compression, $options, $dump_dir_abs, $dump_settings, $dump_filename, $dump_filesize_guess
          , $time_start_0, $progress_dump_fn, $db_size_done, $dump_filesize_guess, $wpconfig, $info_all_rows_count, $password;
 
-    $db_size_done = 0;                  # [DB_NAME] => pre_a_wpexpress
-    $dump_filesize_guess = 0;           # [DB_USER] => pre_a_f1AKE6A6
-    $info_all_rows_count = 0;           # [DB_PASSWORD] => aRLOQtKb
-                                        # [DB_HOST] => 127.0.0.1
-    $dbc = getDbConfig($wpconfig);      # [DB_CHARSET] => utf8
-                                        # [DB_COLLATE] =>
-                                        # [table_prefix] => joJ_
+    $db_size_done = 0;                  # [name] => pre_a_wpexpress
+    $dump_filesize_guess = 0;           # [user] => pre_a_f1AKE6A6
+    $info_all_rows_count = 0;           # [pass] => aRLOQtKb
+                                        # [host] => 127.0.0.1
+    $dbc = getDbConfig($wpconfig);      # [charst] => utf8
+                                        # [collate] =>
 
-    $db_stats = mysql_get_stats($dbc['DB_HOST'], $dbc['DB_USER'], $dbc['DB_PASSWORD'], $dbc['DB_NAME']);  # gives 'tables' 'rows' and 'size'
+    $db_stats = mysql_get_stats($dbc['host'], $dbc['user'], $dbc['pass'], $dbc['name']);  # gives 'tables' 'rows' and 'size'
 
     try {
 
@@ -1914,12 +2320,12 @@ function mysql_dump() {
 
         if (strpos($dbc['DB_HOST'],':')) {
             list($dbhost, $port) = explode(':', $dbc['DB_HOST']);
-            } else {
-              $dbhost=$dbc['DB_HOST'];
-            }
+        } else {
+            $dbhost=$dbc['DB_HOST'];
+        }
 
-
-        if (!is_dir($dump_dir_abs)) { if(!mkdir($dump_dir_abs, 0700, true)) { die("Could not create '".$dump_dir_abs."'. Exit.\n"); } }
+        $user_info = posix_getpwuid(posix_geteuid());
+        if ( !is_dir($dump_dir_abs) ) { if( !mkdir($dump_dir_abs, 0777, true) ) { die( "Could not create " . sq($dump_dir_abs) . ". Exit.\n" . 'PHP läuft als Benutzer: ' . $user_info['name'] . "\n" ); } }
 
         // old variant with PDO
         $mysql_dump = new Mysqldump('mysql:host='.$dbhost.';dbname='.$dbc['DB_NAME'], $dbc['DB_USER'], $dbc['DB_PASSWORD'], $dump_settings);
@@ -1983,7 +2389,7 @@ function mysql_dump() {
             if ( $verb >1 ) echo "\n";
             echo "\r$message";
         }
-    } catch (\Exception $e) {
+    } catch (\Throwable $e) {
         echo( 'mysqldump-php error: ' . $e->getMessage() );
     }
 }
@@ -2006,6 +2412,181 @@ function printf_mysql_progress($percent_done, $table_name, $rows_count, $file_si
     if ($verb >= 1)
     printf( "  %5.1f%% -- %-50s %6s %15s %s\r", $percent_done, $table_name, $rows_count, $file_size_mb, progressBar($percent_done, 42));
     if ($verb >= 2) echo "\n";
+}
+
+
+/**
+ * Main function for MySQL database dump with progress reporting.
+ *
+ * Creates a MySQL dump in pure PHP without external tools. Supports:
+ * - Compression (none, gzip, bzip2)
+ * - AES-256 encryption with password
+ * - Progress reporting via ProgressHandler
+ * - Automatic WordPress configuration detection
+ *
+ * @param array $config Configuration array with keys:
+ *   - 'host' (string): MySQL host
+ *   - 'user' (string): MySQL user
+ *   - 'pass' (string): MySQL password
+ *   - 'name' (string): Database name
+ *   - 'port' (int): MySQL port (default: 3306)
+ *   - 'socket' (string): MySQL socket (optional)
+ *   - 'charset' (string): Character set (default: utf8mb4)
+ *   - 'output_file' (string): Output file path
+ *   - 'compression' (string): 'none', 'gzip', or 'bzip2'
+ *   - 'password' (string): Encryption password (optional)
+ *   - 'no_data' (bool): Structure only, no data (optional)
+ * @param ProgressHandler|null $progress Progress handler for updates
+ * @return array Result array with keys:
+ *   - 'status' (string): 'success' or 'error'
+ *   - 'file' (string): Path to created dump file
+ *   - 'size' (int): File size in bytes
+ *   - 'rows' (int): Total rows exported
+ *   - 'tables' (int): Number of tables
+ *   - 'time' (float): Execution time in seconds
+ *   - 'error' (string): Error message if status is 'error'
+ */
+function wdump(array $config, ?ProgressHandler $progress = null): array {
+    $start_time = microtime(true);
+    
+    // Set defaults
+    $config = array_merge([
+        'port' => 3306,
+        'socket' => null,
+        'charset' => 'utf8mb4',
+        'compression' => 'none',
+        'password' => null,
+        'no_data' => false
+    ], $config);
+    
+    // Validate required fields
+    $required = ['host', 'user', 'pass', 'name', 'output_file'];
+    foreach ($required as $field) {
+        if (empty($config[$field]) && $field !== 'pass') {
+            return [
+                'status' => 'error',
+                'error' => "Missing required configuration field: $field"
+            ];
+        }
+    }
+    
+    try {
+        // Get database statistics
+        $db_stats = mysql_get_stats($config['host'], $config['user'], $config['pass'], $config['name']);
+        
+        // Determine output filename and settings based on compression
+        $output_file = $config['output_file'];
+        $dump_settings = [];
+        
+        if ($config['compression'] === 'bzip2' && function_exists("bzopen")) {
+            $dump_settings['compress'] = Mysqldump::BZIP2;
+            if (!str_ends_with($output_file, '.bz2')) {
+                $output_file .= '.bz2';
+            }
+        } elseif ($config['compression'] === 'gzip' && function_exists("gzopen")) {
+            $dump_settings['compress'] = Mysqldump::GZIP;
+            if (!str_ends_with($output_file, '.gz')) {
+                $output_file .= '.gz';
+            }
+        } else {
+            $dump_settings['compress'] = Mysqldump::NONE;
+            if (!str_ends_with($output_file, '.sql') && !str_ends_with($output_file, '.txt')) {
+                $output_file .= '.sql';
+            }
+        }
+        
+        // Add encryption if password provided
+        if (!empty($config['password'])) {
+            $dump_settings['compress'] = Mysqldump::AES256ENCRYPT;
+            $dump_settings['password'] = $config['password'];
+            if (!str_ends_with($output_file, '.aes')) {
+                $output_file .= '.aes';
+            }
+        }
+        
+        if ($config['no_data']) {
+            $dump_settings['no-data'] = true;
+        }
+        
+        // Ensure output directory exists
+        $output_dir = dirname($output_file);
+        if (!is_dir($output_dir)) {
+            if (!mkdir($output_dir, 0777, true)) {
+                return [
+                    'status' => 'error',
+                    'error' => "Could not create output directory: $output_dir"
+                ];
+            }
+        }
+        
+        // Parse host:port if needed
+        if (strpos($config['host'], ':')) {
+            list($host, $port) = explode(':', $config['host'], 2);
+        } else {
+            $host = $config['host'];
+            $port = $config['port'];
+        }
+        
+        // Create mysqldump instance
+        $mysql_dump = new Mysqldump(
+            'mysql:host=' . $host . ';dbname=' . $config['name'],
+            $config['user'],
+            $config['pass'],
+            $dump_settings
+        );
+        
+        // Set up progress tracking
+        $total_rows = $db_stats['rows'] ?? 0;
+        $rows_processed = 0;
+        
+        if ($progress) {
+            $mysql_dump->setInfoHook(function($table, $info) use ($progress, &$rows_processed, $total_rows, $output_file) {
+                $rows_processed += $info['rowCount'];
+                $message = sprintf("Table: %s (%d rows)", $info['name'], $info['rowCount']);
+                
+                // Update progress
+                if (file_exists($output_file)) {
+                    clearstatcache();
+                }
+                
+                $progress->update($rows_processed, max($total_rows, 1), $message);
+            });
+        }
+        
+        // Execute the dump
+        $mysql_dump->start($output_file);
+        
+        // Get final statistics
+        clearstatcache();
+        $file_size = file_exists($output_file) ? filesize($output_file) : 0;
+        $elapsed = microtime(true) - $start_time;
+        
+        if ($progress) {
+            $progress->finish([
+                'file' => $output_file,
+                'size' => format_bytes($file_size),
+                'rows' => $rows_processed,
+                'tables' => $db_stats['tables'] ?? 0,
+                'time' => sprintf('%.2fs', $elapsed)
+            ]);
+        }
+        
+        return [
+            'status' => 'success',
+            'file' => $output_file,
+            'size' => $file_size,
+            'rows' => $rows_processed,
+            'tables' => $db_stats['tables'] ?? 0,
+            'time' => $elapsed
+        ];
+        
+    } catch (Throwable $e) {
+        return [
+            'status' => 'error',
+            'error' => $e->getMessage(),
+            'trace' => $e->getTraceAsString()
+        ];
+    }
 }
 
 
@@ -2038,46 +2619,435 @@ function option_s() {
 
 
 /**
- * Searches for the next wp-config.php file upwards in the directory tree.
+ * Main function for creating an archive with custom format and selective compression.
  *
- * This function starts in the current directory and moves upwards in the directory
- * structure until it finds a wp-config.php file or reaches the root directory.
+ * Creates an encrypted archive with file-by-file headers. Each file has:
+ * - Type byte (0=directory, 1=uncompressed file, 2=compressed file)
+ * - Data length (4 bytes)
+ * - Path length (2 bytes)
+ * - MD5 checksum (16 bytes)
+ * - Relative path
+ * - File content (compressed if applicable)
  *
- * @param string $startDir The directory to start the search from. Defaults to the current directory.
- *
- * @return string|null The path to the wp-config.php file if found, or null if not found.
- *
- * @example
- * $wpConfigPath = find_wp_config();
- * if ($wpConfigPath) {
- *     echo "Found wp-config.php at: $wpConfigPath";
- * } else {
- *     echo "wp-config.php not found!";
- * }
+ * @param string $source_dir WordPress root directory to archive
+ * @param string $archive_file Output archive file path
+ * @param string $password Encryption password (required)
+ * @param array $options Additional options:
+ *   - 'excluded_paths' (array): Paths to exclude from archive
+ *   - 'compression_level' (int): Gzip compression level (0-9, default: 5)
+ *   - 'min_size_for_compression' (int): Minimum file size to compress (default: 2560 bytes)
+ * @param ProgressHandler|null $progress Progress handler for updates
+ * @return array Result array with keys:
+ *   - 'status' (string): 'success' or 'error'
+ *   - 'archive' (string): Path to created archive
+ *   - 'size' (int): Archive size in bytes
+ *   - 'files' (int): Number of files archived
+ *   - 'dirs' (int): Number of directories archived
+ *   - 'time' (float): Execution time in seconds
+ *   - 'error' (string): Error message if status is 'error'
  */
-function find_wp_config(string $startDir = __DIR__): ?string {
-    // Start the search from the given directory
-    $dir = realpath($startDir);
-
-    // Traverse upwards in the directory tree
-    while ($dir !== false) {
-        $configPath = $dir . DIRECTORY_SEPARATOR . 'wp-config.php';
-
-        // Check if the wp-config.php file exists in the current directory
-        if (file_exists($configPath)) {
-            return $configPath; // Return the full path if found
-        }
-
-        // Move up one level in the directory tree
-        $dir = dirname($dir);
-
-        // Stop if we've reached the root directory
-        if ($dir === '/') {
-            break;
-        }
+function wpack(string $source_dir, string $archive_file, string $password, array $options = [], ?ProgressHandler $progress = null): array {
+    $start_time = microtime(true);
+    
+    // Set defaults
+    $excluded_paths = $options['excluded_paths'] ?? [];
+    $compression_level = $options['compression_level'] ?? 5;
+    $min_size = $options['min_size_for_compression'] ?? 2560;
+    
+    // Validate inputs
+    if (empty($password)) {
+        return [
+            'status' => 'error',
+            'error' => 'Password is required for archive encryption'
+        ];
     }
+    
+    if (!is_dir($source_dir)) {
+        return [
+            'status' => 'error',
+            'error' => "Source directory does not exist: $source_dir"
+        ];
+    }
+    
+    try {
+        // Calculate total size for progress tracking
+        $source_dir = realpath($source_dir);
+        $total_size = 0;
+        $total_files = 0;
+        $total_dirs = 0;
+        
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($source_dir, RecursiveDirectoryIterator::SKIP_DOTS),
+            RecursiveIteratorIterator::SELF_FIRST
+        );
+        
+        foreach ($iterator as $item) {
+            $should_exclude = false;
+            foreach ($excluded_paths as $excluded) {
+                if (strpos($item->getPathname(), $excluded) === 0) {
+                    $should_exclude = true;
+                    break;
+                }
+            }
+            if ($should_exclude) continue;
+            
+            if ($item->isFile()) {
+                $total_files++;
+                $total_size += $item->getSize();
+            } elseif ($item->isDir()) {
+                $total_dirs++;
+            }
+        }
+        
+        // Open archive file for writing
+        $archive_stream = fopen($archive_file, 'wb');
+        if (!$archive_stream) {
+            return [
+                'status' => 'error',
+                'error' => "Cannot create archive file: $archive_file"
+            ];
+        }
+        
+        // Apply encryption filter
+        if (!stream_filter_append($archive_stream, 'aes256', STREAM_FILTER_WRITE, [
+            'mode' => 'encrypt',
+            'password' => $password
+        ])) {
+            fclose($archive_stream);
+            return [
+                'status' => 'error',
+                'error' => 'Cannot apply AES-256 encryption filter'
+            ];
+        }
+        
+        // Archive files
+        $processed_size = 0;
+        $processed_files = 0;
+        $processed_dirs = 0;
+        $processed_total = 0;
+        $total_items = $total_files + $total_dirs;
+        
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($source_dir, RecursiveDirectoryIterator::SKIP_DOTS),
+            RecursiveIteratorIterator::SELF_FIRST
+        );
+        
+        foreach ($iterator as $item) {
+            $current_path = $item->getPathname();
+            
+            // Check exclusions
+            $should_exclude = false;
+            foreach ($excluded_paths as $excluded) {
+                if (strpos($current_path, $excluded) === 0) {
+                    $should_exclude = true;
+                    break;
+                }
+            }
+            
+            // Check .zipignore
+            if ($item->isDir() && !$should_exclude && file_exists($item->getPathname() . '/.zipignore')) {
+                $excluded_paths[] = $item->getPathname() . '/';
+                $should_exclude = true;
+            }
+            
+            if ($should_exclude) continue;
+            
+            // Skip the archive itself
+            if (realpath($current_path) === realpath($archive_file)) {
+                continue;
+            }
+            
+            $relative_path = substr($current_path, strlen($source_dir) + 1);
+            $relative_path = str_replace('\\', '/', $relative_path);
+            
+            // Rename wp-config.php to avoid overwriting on extraction
+            if ($relative_path === 'wp-config.php') {
+                $relative_path = '_wp-config_ORIGINAL.php';
+            }
+            
+            // Determine file type and process content
+            $type = $item->isDir() ? 0 : 1;
+            $content = '';
+            $original_size = 0;
+            $compressed = false;
+            
+            if ($type === 1) {
+                $original_size = $item->getSize();
+                
+                if ($original_size > 0) {
+                    $content = file_get_contents($current_path);
+                    $checksum = md5($content, true);
+                    
+                    // Try compression for eligible files
+                    if ($original_size >= $min_size && shouldCompressFile(basename($current_path), $original_size)) {
+                        $compressed_content = gzencode($content, $compression_level);
+                        if ($compressed_content !== false && strlen($compressed_content) < $original_size) {
+                            $type = 2;  // Compressed file
+                            $content = $compressed_content;
+                            $compressed = true;
+                            $checksum = md5($content, true);
+                        }
+                    }
+                } else {
+                    $checksum = md5('', true);
+                }
+                
+                $processed_files++;
+                $processed_size += $original_size;
+            } else {
+                $checksum = str_repeat("\0", 16);
+                $processed_dirs++;
+            }
+            
+            $processed_total++;
+            
+            // Write header and content
+            fwrite($archive_stream, pack('C', $type));
+            fwrite($archive_stream, pack('N', strlen($content)));
+            fwrite($archive_stream, pack('n', strlen($relative_path)));
+            fwrite($archive_stream, $checksum);
+            fwrite($archive_stream, $relative_path);
+            
+            if ($type !== 0 && strlen($content) > 0) {
+                fwrite($archive_stream, $content);
+            }
+            
+            // Update progress
+            if ($progress && ($processed_total % 100 === 0 || $processed_total === $total_items)) {
+                $message = sprintf("%s (%s)", 
+                    $compressed ? "Compressed: $relative_path" : $relative_path,
+                    format_bytes($original_size)
+                );
+                $progress->update($processed_total, $total_items, $message);
+            }
+        }
+        
+        fclose($archive_stream);
+        
+        $elapsed = microtime(true) - $start_time;
+        $archive_size = filesize($archive_file);
+        
+        if ($progress) {
+            $progress->finish([
+                'archive' => $archive_file,
+                'size' => format_bytes($archive_size),
+                'files' => $processed_files,
+                'dirs' => $processed_dirs,
+                'time' => sprintf('%.2fs', $elapsed)
+            ]);
+        }
+        
+        return [
+            'status' => 'success',
+            'archive' => $archive_file,
+            'size' => $archive_size,
+            'files' => $processed_files,
+            'dirs' => $processed_dirs,
+            'time' => $elapsed
+        ];
+        
+    } catch (Throwable $e) {
+        return [
+            'status' => 'error',
+            'error' => $e->getMessage(),
+            'trace' => $e->getTraceAsString()
+        ];
+    }
+}
 
-    return null; // Return null if wp-config.php was not found
+
+/**
+ * Main function for extracting a custom-format encrypted archive.
+ *
+ * Extracts files from an archive created by wpack(). Handles:
+ * - AES-256 decryption
+ * - Decompression of compressed files
+ * - MD5 checksum verification
+ * - Directory structure recreation
+ *
+ * @param string $archive_file Path to archive file
+ * @param string $output_dir Output directory for extracted files
+ * @param string $password Decryption password
+ * @param int $offset Byte offset to start reading (for SFX archives)
+ * @param ProgressHandler|null $progress Progress handler for updates
+ * @return array Result array with keys:
+ *   - 'status' (string): 'success' or 'error'
+ *   - 'output_dir' (string): Path to extraction directory
+ *   - 'files' (int): Number of files extracted
+ *   - 'dirs' (int): Number of directories created
+ *   - 'time' (float): Execution time in seconds
+ *   - 'error' (string): Error message if status is 'error'
+ */
+function wunpack(string $archive_file, string $output_dir, string $password, int $offset = 0, ?ProgressHandler $progress = null): array {
+    $start_time = microtime(true);
+    
+    // Validate inputs
+    if (!file_exists($archive_file)) {
+        return [
+            'status' => 'error',
+            'error' => "Archive file does not exist: $archive_file"
+        ];
+    }
+    
+    if (empty($password)) {
+        return [
+            'status' => 'error',
+            'error' => 'Password is required for decryption'
+        ];
+    }
+    
+    try {
+        // Open archive
+        $stream = fopen($archive_file, 'rb');
+        if (!$stream) {
+            return [
+                'status' => 'error',
+                'error' => "Cannot open archive file: $archive_file"
+            ];
+        }
+        
+        // Apply decryption filter
+        if (!stream_filter_append($stream, 'aes256', STREAM_FILTER_READ, [
+            'mode' => 'decrypt',
+            'password' => $password
+        ])) {
+            fclose($stream);
+            return [
+                'status' => 'error',
+                'error' => 'Cannot apply AES-256 decryption filter'
+            ];
+        }
+        
+        // Seek to offset if specified (for SFX archives)
+        if ($offset > 0) {
+            fseek($stream, $offset);
+        }
+        
+        // Create output directory
+        if (!is_dir($output_dir)) {
+            if (!mkdir($output_dir, 0777, true)) {
+                fclose($stream);
+                return [
+                    'status' => 'error',
+                    'error' => "Cannot create output directory: $output_dir"
+                ];
+            }
+        }
+        
+        // Calculate total size for progress
+        $total_size = filesize($archive_file) - $offset;
+        $processed_size = 0;
+        $processed_files = 0;
+        $processed_dirs = 0;
+        
+        // Extract files
+        while (!feof($stream)) {
+            // Read header
+            $header = fread($stream, 23);  // 1 + 4 + 2 + 16 bytes
+            if (strlen($header) < 23) break;
+            
+            $unpacked = unpack('Ctype/Ndata_length/npath_length', $header);
+            $md5sum = substr($header, 7, 16);
+            $relative_path = fread($stream, $unpacked['path_length']);
+            
+            if ($unpacked['type'] === 0) {
+                // Directory
+                $full_path = $output_dir . DIRECTORY_SEPARATOR . $relative_path;
+                if (!is_dir($full_path)) {
+                    mkdir($full_path, 0777, true);
+                }
+                $processed_dirs++;
+                $processed_size += 23 + $unpacked['path_length'];
+                
+                if ($progress) {
+                    $progress->update($processed_files + $processed_dirs, 
+                                     max($total_size / 1000, 1), 
+                                     "Dir: $relative_path");
+                }
+                continue;
+            }
+            
+            // Read file content
+            $content = $unpacked['data_length'] > 0 ? fread($stream, $unpacked['data_length']) : '';
+            $processed_size += 23 + $unpacked['path_length'] + $unpacked['data_length'];
+            
+            // Verify checksum
+            if ($unpacked['data_length'] > 0 && md5($content, true) !== $md5sum) {
+                fclose($stream);
+                return [
+                    'status' => 'error',
+                    'error' => "Checksum verification failed for: $relative_path"
+                ];
+            }
+            
+            // Decompress if needed
+            $compressed = ($unpacked['type'] === 2);
+            if ($compressed) {
+                $content = gzdecode($content);
+                if ($content === false) {
+                    fclose($stream);
+                    return [
+                        'status' => 'error',
+                        'error' => "Decompression failed for: $relative_path"
+                    ];
+                }
+            }
+            
+            // Write file
+            $full_path = $output_dir . DIRECTORY_SEPARATOR . $relative_path;
+            $dir = dirname($full_path);
+            if (!is_dir($dir)) {
+                mkdir($dir, 0777, true);
+            }
+            
+            if ($unpacked['data_length'] === 0) {
+                touch($full_path);
+            } else {
+                file_put_contents($full_path, $content);
+            }
+            
+            $processed_files++;
+            
+            // Update progress
+            if ($progress && ($processed_files % 100 === 0 || feof($stream))) {
+                $message = sprintf("%s (%s)", 
+                    $compressed ? "Decompressed: $relative_path" : $relative_path,
+                    format_bytes($unpacked['data_length'])
+                );
+                $progress->update($processed_files + $processed_dirs, 
+                                 max($total_size / 1000, 1), 
+                                 $message);
+            }
+        }
+        
+        fclose($stream);
+        
+        $elapsed = microtime(true) - $start_time;
+        
+        if ($progress) {
+            $progress->finish([
+                'output_dir' => $output_dir,
+                'files' => $processed_files,
+                'dirs' => $processed_dirs,
+                'time' => sprintf('%.2fs', $elapsed)
+            ]);
+        }
+        
+        return [
+            'status' => 'success',
+            'output_dir' => $output_dir,
+            'files' => $processed_files,
+            'dirs' => $processed_dirs,
+            'time' => $elapsed
+        ];
+        
+    } catch (Throwable $e) {
+        return [
+            'status' => 'error',
+            'error' => $e->getMessage(),
+            'trace' => $e->getTraceAsString()
+        ];
+    }
 }
 
 
@@ -2134,22 +3104,21 @@ function __HALT_SFX() {
         $ignored_dirs = create_zipignore_for_backup_plugins();
         calculateTotals($sourceDirectory);  // '/htdocs
         $freeSpace = disk_free_space($sourceDirectory);
-                                            # [DB_NAME] => pre_a_wpexpress
-                                            # [DB_USER] => pre_a_f1AKE6A6
-                                            # [DB_PASSWORD] => aRLOQtKb
-                                            # [DB_HOST] => 127.0.0.1
-        $dbc = getDbConfig($wpconfig);      # [DB_CHARSET] => utf8
-                                            # [DB_COLLATE] =>
-                                            # [table_prefix] => joJ_
 
-        $db_stats = mysql_get_stats($dbc['DB_HOST'], $dbc['DB_USER'], $dbc['DB_PASSWORD'], $dbc['DB_NAME']);  # gives 'tables' 'rows' and 'size'
-                                            # [size] => 11272192
-                                            # [rows] => 1526
-                                            # [tables] => 52
+        $dbc = getDbConfig($wpconfig);            // $dbc['host'],
+                                                  // $dbc['user'],
+                                                  // $dbc['pass'],
+                                                  // $dbc['name'],
+                                                  // $dbc['port'] ?? ini_get("mysqli.default_port"),
+                                                  // $dbc['socket'] ?? ini_get("mysqli.default_socket")
+
+        $db_stats = mysql_get_stats($dbc['host'], $dbc['user'], $dbc['pass'], $dbc['name']);  # gives 'tables' 'rows' and 'size'
+                                                  // [size] => 11272192
+                                                  // [rows] => 1526
+                                                  // [tables] => 52
         if ($verb >= 4) echo "\ndb_stats: " . print_r($db_stats, 1);
 
         $db_size = $db_stats['size'];
-
 
         echo "\nFilesystem is " . format_bytes($totalSize) . '. Found ' . ($totalDirs+$totalFiles) . " items, " . $totalDirs . " directories and " . $totalFiles . " files."
         . "\nCompressing files greater " . format_bytes($GLOBALS['minSizeForCompression']) . ". Creating the archive" . "..."
@@ -2232,7 +3201,7 @@ function __HALT_SFX() {
 
         $dbc = getDbConfig($wpconfig);
         print_r($dbc);
-        importMysqlDumpInChunks($dumpfile, $dbc['DB_HOST'], $dbc['DB_USER'], $dbc['DB_PASSWORD'], $dbc['DB_NAME']);  # gives 'tables' 'rows' and 'size'
+        importMysqlDumpInChunks($dumpfile, $dbc['host'], $dbc['user'], $dbc['pass'], $dbc['name']);  # gives 'tables' 'rows' and 'size'
 
         mysql_import($dumpfile);
 
@@ -2407,6 +3376,444 @@ function append_to_locked_file($fn, $string) {
     fclose($fp);
 }
 
+
+/**
+ * Class MySQLiDump
+ *
+ * A simple MySQL database dump utility using mysqli and optional compression.
+ *
+ * Features:
+ * - Dumps structure and/or data from MySQL tables
+ * - Supports gzip and bzip2 compression
+ * - Allows table inclusion/exclusion
+ * - Supports extended inserts, disabling keys, and locking tables
+ * - Optional single transaction dump
+ * - Output to file or stdout (php://output)
+ *
+ * Settings:
+ * - include_tables (array): Tables to include (empty = all)
+ * - exclude_tables (array): Tables to exclude
+ * - compress (string): 'none', 'gzip', or 'bzip2'
+ * - no_data (bool): If true, only structure is dumped
+ * - add_drop_table (bool): If true, adds DROP TABLE statements
+ * - single_transaction (bool): If true, wraps dump in a transaction
+ * - lock_tables (bool): If true, locks tables (recommended when no transaction is used)
+ * - add_locks (bool): If true, adds LOCK/UNLOCK around inserts
+ * - extended_insert (bool): If true, uses extended INSERT format
+ * - disable_keys (bool): If true, disables keys during inserts
+ * - where (string): Optional WHERE clause applied to all SELECTs
+ * - max_query_size (int): Max byte size per extended INSERT statement
+ * - charset (string): Connection charset (default: utf8mb4)
+ *
+ * Usage:
+ *   $dumper = new MySQLiDump('localhost', 'user', 'pass', 'dbname');
+ *   $dumper->setSettings(['compress' => 'gzip']);
+ *   $dumper->export('dump.sql.gz');
+ *
+ * @package MySQLiDump
+ * @author   Ingo Baab <ingo@baab.de>
+ * @license  http://www.gnu.org/copyleft/gpl.html GNU General Public License
+ * @link     https://baab.de/mysqlidump/
+ */
+class MySQLiDump {
+    private $conn;
+    private $settings = [
+        'include_tables' => [],
+        'exclude_tables' => [],
+        'compress' => 'none', // 'none', 'gzip', 'bzip2'
+        'no_data' => false,
+        'add_drop_table' => true,
+        'single_transaction' => false,
+        'lock_tables' => false,
+        'add_locks' => true,
+        'extended_insert' => true,
+        'disable_keys' => true,
+        'where' => '',
+        'max_query_size' => 1000000,
+        'charset' => 'utf8mb4',
+        'password' => ''
+    ];
+
+    private $progress_callback = null;
+    private $progress_callback_delay = 1.0;
+    private $last_progress_time = 0;
+    private $total_rows = 0;
+    private $exported_rows = 0;
+
+    public function __construct($host, $username, $password, $dbname, $port = 3306, $socket = null, $charset = 'utf8mb4') {
+        $this->conn = new mysqli($host, $username, $password, $dbname, $port, $socket);
+
+        if ($this->conn->connect_error) {
+            throw new Exception('Connect Error (' . $this->conn->connect_errno . ') ' . $this->conn->connect_error);
+        }
+
+        if (!empty($charset)) {
+            if (!$this->conn->set_charset($charset)) {
+                throw new Exception("Invalid character set '$charset' provided. Supported sets: " .
+                    implode(', ', $this->getSupportedCharsets()));
+            }
+            $this->settings['charset'] = $charset;
+        }
+    }
+
+    public function setProgressCallback(callable $callback, $delay = 0.25) {
+        $this->progress_callback = $callback;
+        $this->progress_callback_delay = $delay;
+    }
+
+    private function getSupportedCharsets() {
+        $result = $this->conn->query("SHOW CHARACTER SET");
+        $charsets = [];
+        while ($row = $result->fetch_assoc()) {
+            $charsets[] = $row['Charset'];
+        }
+        return $charsets;
+    }
+
+    public function setSettings($settings) {
+        $this->settings = array_merge($this->settings, $settings);
+    }
+
+    public function export($filename = 'php://output') {
+        $handle = $this->openFile($filename);
+
+        try {
+            $this->calculateTotalRows();
+            $this->exported_rows = 0;
+            $this->last_progress_time = microtime(true);
+
+            $this->writeHeader($handle);
+            $this->exportTables($handle);
+            $this->writeFooter($handle);
+
+            if ($this->progress_callback) {
+                call_user_func($this->progress_callback, 100);
+            }
+        } finally {
+            fclose($handle);
+        }
+    }
+
+    private function calculateTotalRows() {
+        $this->total_rows = 0;
+        foreach ($this->getTables() as $table) {
+            if ($this->settings['no_data']) {
+                continue;
+            }
+            $where = $this->settings['where'] ? " WHERE " . $this->settings['where'] : '';
+            $result = $this->conn->query("SELECT COUNT(*) AS cnt FROM `$table`" . $where);
+            if ($result) {
+                $row = $result->fetch_assoc();
+                $this->total_rows += (int)$row['cnt'];
+            }
+        }
+    }
+
+    private function openFile($filename) {
+        $handle = fopen($filename, 'wb');
+        if (!$handle) {
+            throw new Exception("Unable to open file: $filename");
+        }
+
+        if ($this->settings['compress'] === 'gzip') {
+            if (!function_exists('gzencode')) {
+                throw new Exception("GZIP compression not available: missing zlib.");
+            }
+            stream_filter_append($handle, 'zlib.deflate', STREAM_FILTER_WRITE);
+        } elseif ($this->settings['compress'] === 'bzip2') {
+            if (!function_exists('bzcompress')) {
+                throw new Exception("BZIP2 compression not available: missing bz2.");
+            }
+            stream_filter_append($handle, 'bzip2.compress', STREAM_FILTER_WRITE);
+        }
+
+        if (!empty($this->settings['password'])) {
+            if (!stream_filter_append($handle, 'aes256', STREAM_FILTER_WRITE, [
+                'mode' => 'encrypt',
+                'password' => $this->settings['password']
+            ])) {
+                throw new Exception("Can't append aes256 stream filter.");
+            }
+        }
+
+        return $handle;
+    }
+
+    private function write($handle, $string) {
+        fwrite($handle, $string);
+    }
+
+    private function writeHeader($handle) {
+        $this->write($handle, "-- MySQL dump created by MySQLiDump\n");
+        $this->write($handle, "-- Host: {$this->conn->host_info}\n");
+        $this->write($handle, "-- Generation Time: " . date('r') . "\n");
+        $this->write($handle, "-- Server Version: " . $this->conn->server_info . "\n\n");
+        $this->write($handle, "SET SQL_MODE = \"NO_AUTO_VALUE_ON_ZERO\";\n");
+        $this->write($handle, "SET AUTOCOMMIT = 0;\n");
+        if ($this->settings['single_transaction']) $this->write($handle, "START TRANSACTION;\n");
+        $this->write($handle, "SET time_zone = \"+00:00\";\n\n");
+    }
+
+    private function writeFooter($handle) {
+        if ($this->settings['single_transaction']) $this->write($handle, "COMMIT;\n");
+    }
+
+    private function getTables() {
+        $result = $this->conn->query("SHOW TABLES");
+        $tables = [];
+        while ($row = $result->fetch_row()) {
+            $table = $row[0];
+            if (!empty($this->settings['include_tables']) && !in_array($table, $this->settings['include_tables'])) {
+                continue;
+            }
+            if (in_array($table, $this->settings['exclude_tables'])) {
+                continue;
+            }
+            $tables[] = $table;
+        }
+        return $tables;
+    }
+
+    private function exportTables($handle) {
+        foreach ($this->getTables() as $table) {
+            $this->exportTableStructure($handle, $table);
+            if (!$this->settings['no_data']) {
+                $this->exportTableData($handle, $table);
+            }
+        }
+    }
+
+    private function exportTableStructure($handle, $table) {
+        if ($this->settings['add_drop_table']) {
+            $this->write($handle, "DROP TABLE IF EXISTS `$table`;\n\n");
+        }
+
+        $result = $this->conn->query("SHOW CREATE TABLE `$table`");
+        $row = $result->fetch_row();
+        $this->write($handle, $row[1] . ";\n\n");
+    }
+
+    private function exportTableData($handle, $table) {
+        $where = $this->settings['where'] ? " WHERE " . $this->settings['where'] : '';
+        $result = $this->conn->query("SELECT * FROM `$table`" . $where);
+
+        if ($result->num_rows === 0) return;
+
+        $this->write($handle, "--\n-- Dumping data for `$table`\n--\n\n");
+
+        if ($this->settings['disable_keys']) {
+            $this->write($handle, "ALTER TABLE `$table` DISABLE KEYS;\n");
+        }
+
+        if ($this->settings['add_locks']) {
+            $this->write($handle, "LOCK TABLES `$table` WRITE;\n");
+        }
+
+        $insert_prefix = "INSERT INTO `$table` VALUES ";
+        $line_size = 0;
+        $first_row = true;
+
+        while ($row = $result->fetch_assoc()) {
+            $values = array_map(function ($v) {
+                return is_null($v) ? 'NULL' : "'" . addslashes($v) . "'";
+            }, array_values($row));
+
+            $row_data = "(" . implode(",", $values) . ")";
+
+            if ($this->settings['extended_insert']) {
+                if ($first_row) {
+                    $this->write($handle, $insert_prefix . $row_data);
+                } else {
+                    $this->write($handle, "," . $row_data);
+                }
+
+                $line_size += strlen($row_data);
+                if ($line_size > $this->settings['max_query_size']) {
+                    $this->write($handle, ";\n" . $insert_prefix . $row_data);
+                    $line_size = strlen($row_data);
+                }
+            } else {
+                $this->write($handle, $insert_prefix . $row_data . ";\n");
+            }
+
+            $first_row = false;
+
+            $this->exported_rows++;
+            if ($this->progress_callback) {
+                $now = microtime(true);
+                if (($now - $this->last_progress_time) >= $this->progress_callback_delay) {
+                    $percent = ($this->total_rows > 0) ? ($this->exported_rows / $this->total_rows) * 100 : 100;
+                    call_user_func($this->progress_callback, (float)$percent);
+                    $this->last_progress_time = $now;
+                }
+            }
+        }
+
+        if ($this->settings['extended_insert']) $this->write($handle, ";\n");
+        if ($this->settings['add_locks']) $this->write($handle, "UNLOCK TABLES;\n");
+        if ($this->settings['disable_keys']) $this->write($handle, "ALTER TABLE `$table` ENABLE KEYS;\n");
+
+        $this->write($handle, "\n");
+    }
+
+    /**
+     * Extrahiert eine verschlüsselte/komprimierte Dump-Datei
+     *
+     * @param string $inputFile Eingabedatei (verschlüsselt/komprimiert)
+     * @param string $outputFile Ausgabedatei (unverschlüsselt)
+     * @param string $password Passwort für die Entschlüsselung
+     * @param string $compression Kompressionsmethode ('none', 'gzip', 'bzip2')
+     * @throws Exception Bei Fehlern
+     */
+    public static function extract($inputFile, $outputFile, $password = null, $compression = 'none') {
+        if (!file_exists($inputFile)) {
+            throw new Exception("Input file does not exist: $inputFile");
+        }
+
+        $input = fopen($inputFile, 'rb');
+        if (!$input) {
+            throw new Exception("Cannot open input file: $inputFile");
+        }
+
+        $output = fopen($outputFile, 'wb');
+        if (!$output) {
+            fclose($input);
+            throw new Exception("Cannot create output file: $outputFile");
+        }
+
+        try {
+            // Entschlüsselungsfilter anwenden
+            if ($password) {
+                if (!stream_filter_append($input, 'aes256', STREAM_FILTER_READ, [
+                    'mode' => 'decrypt',
+                    'password' => $password
+                ])) {
+                    throw new Exception("Failed to apply decryption filter");
+                }
+            }
+
+            // Dekompressionsfilter anwenden
+            switch ($compression) {
+                case 'gzip':
+                    if (!stream_filter_append($input, 'zlib.inflate', STREAM_FILTER_READ)) {
+                        throw new Exception("Failed to apply gzip decompression");
+                    }
+                    break;
+                case 'bzip2':
+                    if (!stream_filter_append($input, 'bzip2.decompress', STREAM_FILTER_READ)) {
+                        throw new Exception("Failed to apply bzip2 decompression");
+                    }
+                    break;
+                case 'none':
+                    break;
+                default:
+                    throw new Exception("Unsupported compression method: $compression");
+            }
+
+            // Daten kopieren
+            $bufferSize = 8192;
+            while (!feof($input)) {
+                $data = fread($input, $bufferSize);
+                if ($data === false) {
+                    throw new Exception("Error reading from input file");
+                }
+                if (fwrite($output, $data) === false) {
+                    throw new Exception("Error writing to output file");
+                }
+            }
+        } finally {
+            fclose($input);
+            fclose($output);
+        }
+    }
+
+}
+
+
+class MySQLiDumpExtractor {
+    private $password;
+    private $compress; // 'none', 'gzip', 'bzip2'
+
+    public function __construct($password = '', $compress = 'none') {
+        $this->password = $password;
+        $this->compress = $compress;
+    }
+
+    /**
+     * Extract encrypted & compressed dump file to plain SQL file.
+     *
+     * @param string $inputFile Encrypted & compressed dump filename (e.g. .sql.enc)
+     * @param string $outputFile Output plain SQL filename
+     * @throws Exception on errors
+     */
+    public function extract(string $inputFile, string $outputFile): void {
+        // Check if compression method is supported by PHP environment
+        if ($this->compress === 'gzip' && !function_exists('inflate_init')) {
+            throw new Exception("gzip decompression not supported by this PHP installation.");
+        }
+        if ($this->compress === 'bzip2' && !function_exists('bzopen')) {
+            throw new Exception("bzip2 decompression not supported by this PHP installation.");
+        }
+
+        $in = fopen($inputFile, 'rb');
+        if (!$in) {
+            throw new Exception("Cannot open input file '$inputFile' for reading.");
+        }
+
+        $out = fopen($outputFile, 'wb');
+        if (!$out) {
+            fclose($in);
+            throw new Exception("Cannot open output file '$outputFile' for writing.");
+        }
+
+        try {
+            // Append decrypt filter if password is set
+            if (!empty($this->password)) {
+                if (!stream_filter_append($in, 'aes256', STREAM_FILTER_READ, [
+                    'mode' => 'decrypt',
+                    'password' => $this->password
+                ])) {
+                    throw new Exception("Failed to append aes256 decrypt filter. Possibly wrong filter name or implementation missing.");
+                }
+            }
+
+            // Append decompression filter
+            if ($this->compress === 'gzip') {
+                if (!stream_filter_append($in, 'zlib.inflate', STREAM_FILTER_READ)) {
+                    throw new Exception("Failed to append gzip inflate filter.");
+                }
+            } elseif ($this->compress === 'bzip2') {
+                if (!stream_filter_append($in, 'bzip2.decompress', STREAM_FILTER_READ)) {
+                    throw new Exception("Failed to append bzip2 decompress filter.");
+                }
+            } elseif ($this->compress !== 'none') {
+                throw new Exception("Unsupported compression method: {$this->compress}");
+            }
+
+            $total_bytes = 0;
+            while (!feof($in)) {
+                $data = fread($in, 8192);
+                if ($data === false) {
+                    throw new Exception("Error reading input file " . $inputFile . " during extraction.");
+                }
+                $bytes_written = fwrite($out, $data);
+                if ($bytes_written === false || $bytes_written !== strlen($data)) {
+                    throw new Exception("Error writing to output file during extraction.");
+                }
+                $total_bytes += $bytes_written;
+            }
+
+            // Simple heuristic: if output file is empty or very small, maybe password wrong
+            if ($total_bytes === 0) {
+                throw new Exception("Extraction resulted in empty output file. Possibly wrong password or corrupted input.");
+            }
+
+        } finally {
+            fclose($in);
+            fclose($out);
+        }
+    }
+  }
 
 /**
  * PHP version of mysqldump cli that comes with MySQL.
@@ -4926,6 +6333,22 @@ function is_directly_executed(string $file = __FILE__): bool {
 }
 
 
+
+/**
+ * Returns a comma-separated list of all loaded PHP extensions.
+ *
+ * This function retrieves all currently loaded PHP extensions using
+ * `get_loaded_extensions()`, sorts them alphabetically, and returns
+ * them as a single comma-separated string.
+ *
+ * @return string A comma-separated list of loaded PHP extension names.
+ */
+function get_loaded_php_modules(): string {
+    $modules = get_loaded_extensions();
+    sort($modules); // optional: alphabetisch sortieren
+    return implode(', ', $modules);
+}
+
 /**
  * Executes a function based on whether the current script is being directly executed or included.
  *
@@ -4945,7 +6368,7 @@ if (is_directly_executed() && $my_basename === 'helper.inc.php') {
     // this __FILE__ is included by the plugin
 } elseif (is_directly_executed()) { // wpack.php (or in wpsfx..php) or wunpack.php
     echo "my_basename: $my_basename" . "\n\n";
-    stream_filter_register("aes256", AES256StreamFilter::class);
+    // stream_filter_register("aes256", AES256StreamFilter::class);
     __HALT_SFX();
 }
 __HALT_COMPILER();
