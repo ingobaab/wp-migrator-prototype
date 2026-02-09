@@ -196,6 +196,261 @@ $progress_update_after_files_processed = 100;  // 1 shows all files
 $allUnknownExtensions = [];
 
 
+/**
+ * Interface for progress reporting during long-running operations.
+ * 
+ * This interface allows different implementations for CLI output, 
+ * AJAX/WebGUI updates, or silent operation during testing.
+ */
+interface ProgressHandler {
+    /**
+     * Update progress with current state.
+     * 
+     * @param int $current Current progress value (e.g., rows processed, files processed)
+     * @param int $total Total expected value
+     * @param string $message Optional status message
+     * @return void
+     */
+    public function update(int $current, int $total, string $message = ''): void;
+    
+    /**
+     * Signal that the operation has finished.
+     * 
+     * @param array $stats Final statistics (e.g., total time, items processed)
+     * @return void
+     */
+    public function finish(array $stats = []): void;
+}
+
+
+/**
+ * Progress handler for command-line interface with formatted progress bar.
+ * 
+ * Supports three verbosity levels:
+ * - 0: Single self-overwriting line with progress bar, percentage, and ETA
+ * - 1: Progress bar + periodic status updates (~20 lines)
+ * - 2+: Detailed output showing every record/file processed
+ */
+class CliProgressHandler implements ProgressHandler {
+    private int $verbosity;
+    private float $start_time;
+    private int $last_current = 0;
+    private float $last_update_time = 0;
+    private int $update_counter = 0;
+    private bool $finished = false;
+    
+    /**
+     * @param int $verbosity Verbosity level (0=minimal, 1=normal, 2+=verbose)
+     */
+    public function __construct(int $verbosity = 0) {
+        $this->verbosity = $verbosity;
+        $this->start_time = microtime(true);
+        $this->last_update_time = $this->start_time;
+    }
+    
+    public function update(int $current, int $total, string $message = ''): void {
+        if ($this->finished) return;
+        
+        $now = microtime(true);
+        $this->update_counter++;
+        
+        // Calculate progress
+        $percent = ($total > 0) ? ($current / $total * 100) : 0;
+        $elapsed = $now - $this->start_time;
+        $eta = $this->calculateETA($current, $total, $elapsed);
+        
+        // Verbosity level 2+: Show every item
+        if ($this->verbosity >= 2) {
+            if ($message) {
+                echo sprintf("[%d/%d] %s\n", $current, $total, $message);
+            }
+            return;
+        }
+        
+        // Verbosity level 1: Show updates every ~100 items or every 2 seconds
+        if ($this->verbosity === 1) {
+            if ($this->update_counter % 100 === 0 || ($now - $this->last_update_time) >= 2.0) {
+                $bar = $this->renderProgressBar($percent, 30);
+                echo sprintf("\r%s %6.1f%% | %s | ETA: %s | Elapsed: %s", 
+                    $bar, $percent, $message ?: 'Processing', $eta, $this->formatTime($elapsed));
+                $this->last_update_time = $now;
+            }
+            return;
+        }
+        
+        // Verbosity level 0: Single self-overwriting line, update every 0.5 seconds
+        if (($now - $this->last_update_time) >= 0.5 || $current === $total) {
+            $bar = $this->renderProgressBar($percent, 40);
+            echo sprintf("\r%s %6.1f%% (%d/%d) ETA: %s", 
+                $bar, $percent, $current, $total, $eta);
+            $this->last_update_time = $now;
+        }
+        
+        $this->last_current = $current;
+    }
+    
+    public function finish(array $stats = []): void {
+        if ($this->finished) return;
+        $this->finished = true;
+        
+        $elapsed = microtime(true) - $this->start_time;
+        
+        if ($this->verbosity === 0) {
+            // Complete the progress bar line
+            $bar = $this->renderProgressBar(100, 40);
+            echo sprintf("\r%s 100.0%% (%s)\n", $bar, $this->formatTime($elapsed));
+        } elseif ($this->verbosity === 1) {
+            echo sprintf("\n✓ Completed in %s\n", $this->formatTime($elapsed));
+        } else {
+            echo sprintf("\n✓ Completed in %s", $this->formatTime($elapsed));
+            if (!empty($stats)) {
+                echo " - Stats: " . json_encode($stats);
+            }
+            echo "\n";
+        }
+    }
+    
+    /**
+     * Render a text-based progress bar.
+     * 
+     * @param float $percent Percentage complete (0-100)
+     * @param int $width Width of the progress bar in characters
+     * @return string Formatted progress bar
+     */
+    private function renderProgressBar(float $percent, int $width = 40): string {
+        $filled = (int)($width * $percent / 100);
+        $empty = $width - $filled;
+        return '[' . str_repeat('=', $filled) . str_repeat(' ', $empty) . ']';
+    }
+    
+    /**
+     * Calculate estimated time remaining.
+     * 
+     * @param int $current Current progress
+     * @param int $total Total expected
+     * @param float $elapsed Time elapsed in seconds
+     * @return string Formatted ETA string
+     */
+    private function calculateETA(int $current, int $total, float $elapsed): string {
+        if ($current === 0 || $total === 0) {
+            return '--:--';
+        }
+        
+        $rate = $current / $elapsed;
+        $remaining = $total - $current;
+        $eta_seconds = ($rate > 0) ? ($remaining / $rate) : 0;
+        
+        return $this->formatTime($eta_seconds);
+    }
+    
+    /**
+     * Format time duration in human-readable format.
+     * 
+     * @param float $seconds Time in seconds
+     * @return string Formatted time string
+     */
+    private function formatTime(float $seconds): string {
+        if ($seconds < 60) {
+            return sprintf('%ds', (int)$seconds);
+        } elseif ($seconds < 3600) {
+            return sprintf('%dm %ds', (int)($seconds / 60), (int)($seconds % 60));
+        } else {
+            $hours = (int)($seconds / 3600);
+            $minutes = (int)(($seconds % 3600) / 60);
+            return sprintf('%dh %dm', $hours, $minutes);
+        }
+    }
+}
+
+
+/**
+ * Progress handler for AJAX/WebGUI that writes progress to a JSON file.
+ * 
+ * The WebGUI can poll this file to update a progress bar in the browser.
+ */
+class AjaxProgressHandler implements ProgressHandler {
+    private string $progress_file;
+    private float $start_time;
+    private int $last_written = 0;
+    
+    /**
+     * @param string $progress_file Path to JSON file for progress updates
+     */
+    public function __construct(string $progress_file) {
+        $this->progress_file = $progress_file;
+        $this->start_time = microtime(true);
+        
+        // Initialize progress file
+        $this->writeProgress([
+            'status' => 'started',
+            'percent' => 0,
+            'current' => 0,
+            'total' => 0,
+            'message' => 'Starting...',
+            'start_time' => $this->start_time
+        ]);
+    }
+    
+    public function update(int $current, int $total, string $message = ''): void {
+        $now = microtime(true);
+        $elapsed = $now - $this->start_time;
+        $percent = ($total > 0) ? ($current / $total * 100) : 0;
+        
+        // Write update every 100 items or if more than 1 second has passed
+        if (($current - $this->last_written) >= 100 || ($current === $total) || $elapsed < 1) {
+            $this->writeProgress([
+                'status' => 'running',
+                'percent' => round($percent, 1),
+                'current' => $current,
+                'total' => $total,
+                'message' => $message ?: 'Processing...',
+                'elapsed' => round($elapsed, 1),
+                'timestamp' => $now
+            ]);
+            $this->last_written = $current;
+        }
+    }
+    
+    public function finish(array $stats = []): void {
+        $elapsed = microtime(true) - $this->start_time;
+        $this->writeProgress([
+            'status' => 'completed',
+            'percent' => 100,
+            'message' => 'Completed',
+            'elapsed' => round($elapsed, 1),
+            'stats' => $stats,
+            'timestamp' => microtime(true)
+        ]);
+    }
+    
+    /**
+     * Write progress data to JSON file.
+     * 
+     * @param array $data Progress data to write
+     */
+    private function writeProgress(array $data): void {
+        $json = json_encode($data, JSON_PRETTY_PRINT) . "\n";
+        @file_put_contents($this->progress_file, $json, LOCK_EX);
+    }
+}
+
+
+/**
+ * Silent progress handler for testing or batch operations.
+ * 
+ * Does not produce any output.
+ */
+class SilentProgressHandler implements ProgressHandler {
+    public function update(int $current, int $total, string $message = ''): void {
+        // Silent - no output
+    }
+    
+    public function finish(array $stats = []): void {
+        // Silent - no output
+    }
+}
+
+
 class AES256StreamFilter extends php_user_filter
 {
     private const SALT_SIZE = 16;
@@ -2160,6 +2415,181 @@ function printf_mysql_progress($percent_done, $table_name, $rows_count, $file_si
 
 
 /**
+ * Main function for MySQL database dump with progress reporting.
+ *
+ * Creates a MySQL dump in pure PHP without external tools. Supports:
+ * - Compression (none, gzip, bzip2)
+ * - AES-256 encryption with password
+ * - Progress reporting via ProgressHandler
+ * - Automatic WordPress configuration detection
+ *
+ * @param array $config Configuration array with keys:
+ *   - 'host' (string): MySQL host
+ *   - 'user' (string): MySQL user
+ *   - 'pass' (string): MySQL password
+ *   - 'name' (string): Database name
+ *   - 'port' (int): MySQL port (default: 3306)
+ *   - 'socket' (string): MySQL socket (optional)
+ *   - 'charset' (string): Character set (default: utf8mb4)
+ *   - 'output_file' (string): Output file path
+ *   - 'compression' (string): 'none', 'gzip', or 'bzip2'
+ *   - 'password' (string): Encryption password (optional)
+ *   - 'no_data' (bool): Structure only, no data (optional)
+ * @param ProgressHandler|null $progress Progress handler for updates
+ * @return array Result array with keys:
+ *   - 'status' (string): 'success' or 'error'
+ *   - 'file' (string): Path to created dump file
+ *   - 'size' (int): File size in bytes
+ *   - 'rows' (int): Total rows exported
+ *   - 'tables' (int): Number of tables
+ *   - 'time' (float): Execution time in seconds
+ *   - 'error' (string): Error message if status is 'error'
+ */
+function wdump(array $config, ?ProgressHandler $progress = null): array {
+    $start_time = microtime(true);
+    
+    // Set defaults
+    $config = array_merge([
+        'port' => 3306,
+        'socket' => null,
+        'charset' => 'utf8mb4',
+        'compression' => 'none',
+        'password' => null,
+        'no_data' => false
+    ], $config);
+    
+    // Validate required fields
+    $required = ['host', 'user', 'pass', 'name', 'output_file'];
+    foreach ($required as $field) {
+        if (empty($config[$field]) && $field !== 'pass') {
+            return [
+                'status' => 'error',
+                'error' => "Missing required configuration field: $field"
+            ];
+        }
+    }
+    
+    try {
+        // Get database statistics
+        $db_stats = mysql_get_stats($config['host'], $config['user'], $config['pass'], $config['name']);
+        
+        // Determine output filename and settings based on compression
+        $output_file = $config['output_file'];
+        $dump_settings = [];
+        
+        if ($config['compression'] === 'bzip2' && function_exists("bzopen")) {
+            $dump_settings['compress'] = Mysqldump::BZIP2;
+            if (!str_ends_with($output_file, '.bz2')) {
+                $output_file .= '.bz2';
+            }
+        } elseif ($config['compression'] === 'gzip' && function_exists("gzopen")) {
+            $dump_settings['compress'] = Mysqldump::GZIP;
+            if (!str_ends_with($output_file, '.gz')) {
+                $output_file .= '.gz';
+            }
+        } else {
+            $dump_settings['compress'] = Mysqldump::NONE;
+            if (!str_ends_with($output_file, '.sql') && !str_ends_with($output_file, '.txt')) {
+                $output_file .= '.sql';
+            }
+        }
+        
+        // Add encryption if password provided
+        if (!empty($config['password'])) {
+            $dump_settings['compress'] = Mysqldump::AES256ENCRYPT;
+            $dump_settings['password'] = $config['password'];
+            if (!str_ends_with($output_file, '.aes')) {
+                $output_file .= '.aes';
+            }
+        }
+        
+        if ($config['no_data']) {
+            $dump_settings['no-data'] = true;
+        }
+        
+        // Ensure output directory exists
+        $output_dir = dirname($output_file);
+        if (!is_dir($output_dir)) {
+            if (!mkdir($output_dir, 0777, true)) {
+                return [
+                    'status' => 'error',
+                    'error' => "Could not create output directory: $output_dir"
+                ];
+            }
+        }
+        
+        // Parse host:port if needed
+        if (strpos($config['host'], ':')) {
+            list($host, $port) = explode(':', $config['host'], 2);
+        } else {
+            $host = $config['host'];
+            $port = $config['port'];
+        }
+        
+        // Create mysqldump instance
+        $mysql_dump = new Mysqldump(
+            'mysql:host=' . $host . ';dbname=' . $config['name'],
+            $config['user'],
+            $config['pass'],
+            $dump_settings
+        );
+        
+        // Set up progress tracking
+        $total_rows = $db_stats['rows'] ?? 0;
+        $rows_processed = 0;
+        
+        if ($progress) {
+            $mysql_dump->setInfoHook(function($table, $info) use ($progress, &$rows_processed, $total_rows, $output_file) {
+                $rows_processed += $info['rowCount'];
+                $message = sprintf("Table: %s (%d rows)", $info['name'], $info['rowCount']);
+                
+                // Update progress
+                if (file_exists($output_file)) {
+                    clearstatcache();
+                }
+                
+                $progress->update($rows_processed, max($total_rows, 1), $message);
+            });
+        }
+        
+        // Execute the dump
+        $mysql_dump->start($output_file);
+        
+        // Get final statistics
+        clearstatcache();
+        $file_size = file_exists($output_file) ? filesize($output_file) : 0;
+        $elapsed = microtime(true) - $start_time;
+        
+        if ($progress) {
+            $progress->finish([
+                'file' => $output_file,
+                'size' => format_bytes($file_size),
+                'rows' => $rows_processed,
+                'tables' => $db_stats['tables'] ?? 0,
+                'time' => sprintf('%.2fs', $elapsed)
+            ]);
+        }
+        
+        return [
+            'status' => 'success',
+            'file' => $output_file,
+            'size' => $file_size,
+            'rows' => $rows_processed,
+            'tables' => $db_stats['tables'] ?? 0,
+            'time' => $elapsed
+        ];
+        
+    } catch (Throwable $e) {
+        return [
+            'status' => 'error',
+            'error' => $e->getMessage(),
+            'trace' => $e->getTraceAsString()
+        ];
+    }
+}
+
+
+/**
  * Checks if the info option is set.
  *
  * This function checks whether either `-i` or `--info` has been passed as an option.
@@ -2184,6 +2614,439 @@ function option_i() {
 function option_s() {
     global $options;
     return isset($options["s"]) or isset($options["size"]);
+}
+
+
+/**
+ * Main function for creating an archive with custom format and selective compression.
+ *
+ * Creates an encrypted archive with file-by-file headers. Each file has:
+ * - Type byte (0=directory, 1=uncompressed file, 2=compressed file)
+ * - Data length (4 bytes)
+ * - Path length (2 bytes)
+ * - MD5 checksum (16 bytes)
+ * - Relative path
+ * - File content (compressed if applicable)
+ *
+ * @param string $source_dir WordPress root directory to archive
+ * @param string $archive_file Output archive file path
+ * @param string $password Encryption password (required)
+ * @param array $options Additional options:
+ *   - 'excluded_paths' (array): Paths to exclude from archive
+ *   - 'compression_level' (int): Gzip compression level (0-9, default: 5)
+ *   - 'min_size_for_compression' (int): Minimum file size to compress (default: 2560 bytes)
+ * @param ProgressHandler|null $progress Progress handler for updates
+ * @return array Result array with keys:
+ *   - 'status' (string): 'success' or 'error'
+ *   - 'archive' (string): Path to created archive
+ *   - 'size' (int): Archive size in bytes
+ *   - 'files' (int): Number of files archived
+ *   - 'dirs' (int): Number of directories archived
+ *   - 'time' (float): Execution time in seconds
+ *   - 'error' (string): Error message if status is 'error'
+ */
+function wpack(string $source_dir, string $archive_file, string $password, array $options = [], ?ProgressHandler $progress = null): array {
+    $start_time = microtime(true);
+    
+    // Set defaults
+    $excluded_paths = $options['excluded_paths'] ?? [];
+    $compression_level = $options['compression_level'] ?? 5;
+    $min_size = $options['min_size_for_compression'] ?? 2560;
+    
+    // Validate inputs
+    if (empty($password)) {
+        return [
+            'status' => 'error',
+            'error' => 'Password is required for archive encryption'
+        ];
+    }
+    
+    if (!is_dir($source_dir)) {
+        return [
+            'status' => 'error',
+            'error' => "Source directory does not exist: $source_dir"
+        ];
+    }
+    
+    try {
+        // Calculate total size for progress tracking
+        $source_dir = realpath($source_dir);
+        $total_size = 0;
+        $total_files = 0;
+        $total_dirs = 0;
+        
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($source_dir, RecursiveDirectoryIterator::SKIP_DOTS),
+            RecursiveIteratorIterator::SELF_FIRST
+        );
+        
+        foreach ($iterator as $item) {
+            $should_exclude = false;
+            foreach ($excluded_paths as $excluded) {
+                if (strpos($item->getPathname(), $excluded) === 0) {
+                    $should_exclude = true;
+                    break;
+                }
+            }
+            if ($should_exclude) continue;
+            
+            if ($item->isFile()) {
+                $total_files++;
+                $total_size += $item->getSize();
+            } elseif ($item->isDir()) {
+                $total_dirs++;
+            }
+        }
+        
+        // Open archive file for writing
+        $archive_stream = fopen($archive_file, 'wb');
+        if (!$archive_stream) {
+            return [
+                'status' => 'error',
+                'error' => "Cannot create archive file: $archive_file"
+            ];
+        }
+        
+        // Apply encryption filter
+        if (!stream_filter_append($archive_stream, 'aes256', STREAM_FILTER_WRITE, [
+            'mode' => 'encrypt',
+            'password' => $password
+        ])) {
+            fclose($archive_stream);
+            return [
+                'status' => 'error',
+                'error' => 'Cannot apply AES-256 encryption filter'
+            ];
+        }
+        
+        // Archive files
+        $processed_size = 0;
+        $processed_files = 0;
+        $processed_dirs = 0;
+        $processed_total = 0;
+        $total_items = $total_files + $total_dirs;
+        
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($source_dir, RecursiveDirectoryIterator::SKIP_DOTS),
+            RecursiveIteratorIterator::SELF_FIRST
+        );
+        
+        foreach ($iterator as $item) {
+            $current_path = $item->getPathname();
+            
+            // Check exclusions
+            $should_exclude = false;
+            foreach ($excluded_paths as $excluded) {
+                if (strpos($current_path, $excluded) === 0) {
+                    $should_exclude = true;
+                    break;
+                }
+            }
+            
+            // Check .zipignore
+            if ($item->isDir() && !$should_exclude && file_exists($item->getPathname() . '/.zipignore')) {
+                $excluded_paths[] = $item->getPathname() . '/';
+                $should_exclude = true;
+            }
+            
+            if ($should_exclude) continue;
+            
+            // Skip the archive itself
+            if (realpath($current_path) === realpath($archive_file)) {
+                continue;
+            }
+            
+            $relative_path = substr($current_path, strlen($source_dir) + 1);
+            $relative_path = str_replace('\\', '/', $relative_path);
+            
+            // Rename wp-config.php to avoid overwriting on extraction
+            if ($relative_path === 'wp-config.php') {
+                $relative_path = '_wp-config_ORIGINAL.php';
+            }
+            
+            // Determine file type and process content
+            $type = $item->isDir() ? 0 : 1;
+            $content = '';
+            $original_size = 0;
+            $compressed = false;
+            
+            if ($type === 1) {
+                $original_size = $item->getSize();
+                
+                if ($original_size > 0) {
+                    $content = file_get_contents($current_path);
+                    $checksum = md5($content, true);
+                    
+                    // Try compression for eligible files
+                    if ($original_size >= $min_size && shouldCompressFile(basename($current_path), $original_size)) {
+                        $compressed_content = gzencode($content, $compression_level);
+                        if ($compressed_content !== false && strlen($compressed_content) < $original_size) {
+                            $type = 2;  // Compressed file
+                            $content = $compressed_content;
+                            $compressed = true;
+                            $checksum = md5($content, true);
+                        }
+                    }
+                } else {
+                    $checksum = md5('', true);
+                }
+                
+                $processed_files++;
+                $processed_size += $original_size;
+            } else {
+                $checksum = str_repeat("\0", 16);
+                $processed_dirs++;
+            }
+            
+            $processed_total++;
+            
+            // Write header and content
+            fwrite($archive_stream, pack('C', $type));
+            fwrite($archive_stream, pack('N', strlen($content)));
+            fwrite($archive_stream, pack('n', strlen($relative_path)));
+            fwrite($archive_stream, $checksum);
+            fwrite($archive_stream, $relative_path);
+            
+            if ($type !== 0 && strlen($content) > 0) {
+                fwrite($archive_stream, $content);
+            }
+            
+            // Update progress
+            if ($progress && ($processed_total % 100 === 0 || $processed_total === $total_items)) {
+                $message = sprintf("%s (%s)", 
+                    $compressed ? "Compressed: $relative_path" : $relative_path,
+                    format_bytes($original_size)
+                );
+                $progress->update($processed_total, $total_items, $message);
+            }
+        }
+        
+        fclose($archive_stream);
+        
+        $elapsed = microtime(true) - $start_time;
+        $archive_size = filesize($archive_file);
+        
+        if ($progress) {
+            $progress->finish([
+                'archive' => $archive_file,
+                'size' => format_bytes($archive_size),
+                'files' => $processed_files,
+                'dirs' => $processed_dirs,
+                'time' => sprintf('%.2fs', $elapsed)
+            ]);
+        }
+        
+        return [
+            'status' => 'success',
+            'archive' => $archive_file,
+            'size' => $archive_size,
+            'files' => $processed_files,
+            'dirs' => $processed_dirs,
+            'time' => $elapsed
+        ];
+        
+    } catch (Throwable $e) {
+        return [
+            'status' => 'error',
+            'error' => $e->getMessage(),
+            'trace' => $e->getTraceAsString()
+        ];
+    }
+}
+
+
+/**
+ * Main function for extracting a custom-format encrypted archive.
+ *
+ * Extracts files from an archive created by wpack(). Handles:
+ * - AES-256 decryption
+ * - Decompression of compressed files
+ * - MD5 checksum verification
+ * - Directory structure recreation
+ *
+ * @param string $archive_file Path to archive file
+ * @param string $output_dir Output directory for extracted files
+ * @param string $password Decryption password
+ * @param int $offset Byte offset to start reading (for SFX archives)
+ * @param ProgressHandler|null $progress Progress handler for updates
+ * @return array Result array with keys:
+ *   - 'status' (string): 'success' or 'error'
+ *   - 'output_dir' (string): Path to extraction directory
+ *   - 'files' (int): Number of files extracted
+ *   - 'dirs' (int): Number of directories created
+ *   - 'time' (float): Execution time in seconds
+ *   - 'error' (string): Error message if status is 'error'
+ */
+function wunpack(string $archive_file, string $output_dir, string $password, int $offset = 0, ?ProgressHandler $progress = null): array {
+    $start_time = microtime(true);
+    
+    // Validate inputs
+    if (!file_exists($archive_file)) {
+        return [
+            'status' => 'error',
+            'error' => "Archive file does not exist: $archive_file"
+        ];
+    }
+    
+    if (empty($password)) {
+        return [
+            'status' => 'error',
+            'error' => 'Password is required for decryption'
+        ];
+    }
+    
+    try {
+        // Open archive
+        $stream = fopen($archive_file, 'rb');
+        if (!$stream) {
+            return [
+                'status' => 'error',
+                'error' => "Cannot open archive file: $archive_file"
+            ];
+        }
+        
+        // Apply decryption filter
+        if (!stream_filter_append($stream, 'aes256', STREAM_FILTER_READ, [
+            'mode' => 'decrypt',
+            'password' => $password
+        ])) {
+            fclose($stream);
+            return [
+                'status' => 'error',
+                'error' => 'Cannot apply AES-256 decryption filter'
+            ];
+        }
+        
+        // Seek to offset if specified (for SFX archives)
+        if ($offset > 0) {
+            fseek($stream, $offset);
+        }
+        
+        // Create output directory
+        if (!is_dir($output_dir)) {
+            if (!mkdir($output_dir, 0777, true)) {
+                fclose($stream);
+                return [
+                    'status' => 'error',
+                    'error' => "Cannot create output directory: $output_dir"
+                ];
+            }
+        }
+        
+        // Calculate total size for progress
+        $total_size = filesize($archive_file) - $offset;
+        $processed_size = 0;
+        $processed_files = 0;
+        $processed_dirs = 0;
+        
+        // Extract files
+        while (!feof($stream)) {
+            // Read header
+            $header = fread($stream, 23);  // 1 + 4 + 2 + 16 bytes
+            if (strlen($header) < 23) break;
+            
+            $unpacked = unpack('Ctype/Ndata_length/npath_length', $header);
+            $md5sum = substr($header, 7, 16);
+            $relative_path = fread($stream, $unpacked['path_length']);
+            
+            if ($unpacked['type'] === 0) {
+                // Directory
+                $full_path = $output_dir . DIRECTORY_SEPARATOR . $relative_path;
+                if (!is_dir($full_path)) {
+                    mkdir($full_path, 0777, true);
+                }
+                $processed_dirs++;
+                $processed_size += 23 + $unpacked['path_length'];
+                
+                if ($progress) {
+                    $progress->update($processed_files + $processed_dirs, 
+                                     max($total_size / 1000, 1), 
+                                     "Dir: $relative_path");
+                }
+                continue;
+            }
+            
+            // Read file content
+            $content = $unpacked['data_length'] > 0 ? fread($stream, $unpacked['data_length']) : '';
+            $processed_size += 23 + $unpacked['path_length'] + $unpacked['data_length'];
+            
+            // Verify checksum
+            if ($unpacked['data_length'] > 0 && md5($content, true) !== $md5sum) {
+                fclose($stream);
+                return [
+                    'status' => 'error',
+                    'error' => "Checksum verification failed for: $relative_path"
+                ];
+            }
+            
+            // Decompress if needed
+            $compressed = ($unpacked['type'] === 2);
+            if ($compressed) {
+                $content = gzdecode($content);
+                if ($content === false) {
+                    fclose($stream);
+                    return [
+                        'status' => 'error',
+                        'error' => "Decompression failed for: $relative_path"
+                    ];
+                }
+            }
+            
+            // Write file
+            $full_path = $output_dir . DIRECTORY_SEPARATOR . $relative_path;
+            $dir = dirname($full_path);
+            if (!is_dir($dir)) {
+                mkdir($dir, 0777, true);
+            }
+            
+            if ($unpacked['data_length'] === 0) {
+                touch($full_path);
+            } else {
+                file_put_contents($full_path, $content);
+            }
+            
+            $processed_files++;
+            
+            // Update progress
+            if ($progress && ($processed_files % 100 === 0 || feof($stream))) {
+                $message = sprintf("%s (%s)", 
+                    $compressed ? "Decompressed: $relative_path" : $relative_path,
+                    format_bytes($unpacked['data_length'])
+                );
+                $progress->update($processed_files + $processed_dirs, 
+                                 max($total_size / 1000, 1), 
+                                 $message);
+            }
+        }
+        
+        fclose($stream);
+        
+        $elapsed = microtime(true) - $start_time;
+        
+        if ($progress) {
+            $progress->finish([
+                'output_dir' => $output_dir,
+                'files' => $processed_files,
+                'dirs' => $processed_dirs,
+                'time' => sprintf('%.2fs', $elapsed)
+            ]);
+        }
+        
+        return [
+            'status' => 'success',
+            'output_dir' => $output_dir,
+            'files' => $processed_files,
+            'dirs' => $processed_dirs,
+            'time' => $elapsed
+        ];
+        
+    } catch (Throwable $e) {
+        return [
+            'status' => 'error',
+            'error' => $e->getMessage(),
+            'trace' => $e->getTraceAsString()
+        ];
+    }
 }
 
 
