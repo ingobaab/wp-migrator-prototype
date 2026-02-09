@@ -372,6 +372,7 @@ class AjaxProgressHandler implements ProgressHandler {
     private string $progress_file;
     private float $start_time;
     private int $last_written = 0;
+    private float $last_update_time = 0;
     
     /**
      * @param string $progress_file Path to JSON file for progress updates
@@ -396,8 +397,9 @@ class AjaxProgressHandler implements ProgressHandler {
         $elapsed = $now - $this->start_time;
         $percent = ($total > 0) ? ($current / $total * 100) : 0;
         
-        // Write update every 100 items or if more than 1 second has passed
-        if (($current - $this->last_written) >= 100 || ($current === $total) || $elapsed < 1) {
+        // Write update every 100 items or if more than 1 second has passed since last write
+        $time_since_last_write = $now - ($this->last_update_time ?: $this->start_time);
+        if (($current - $this->last_written) >= 100 || ($current === $total) || $time_since_last_write >= 1.0) {
             $this->writeProgress([
                 'status' => 'running',
                 'percent' => round($percent, 1),
@@ -408,6 +410,7 @@ class AjaxProgressHandler implements ProgressHandler {
                 'timestamp' => $now
             ]);
             $this->last_written = $current;
+            $this->last_update_time = $now;
         }
     }
     
