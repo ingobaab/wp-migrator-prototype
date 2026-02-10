@@ -1976,16 +1976,17 @@ function getOptions() {
     if (isset($options["c"])) $gzipCompressionLevel = (int)$options["c"];
     if (isset($options["V"]) or isset($options["version"])) die('Version: ' . $version . "\n\n");
     if (isset($options["u"]) or isset($options["update"])) {
-        echo "Updating " . basename(__FILE__) . " Version " . $version . ' ';
-        $cmd='wget -q https://pre.a.wpexpress.de/wp-content/uploads/wpmove/src/wpack.php -O' . __FILE__;
+        $script_path = realpath($GLOBALS['argv'][0] ?? __FILE__);
+        echo "Updating " . basename($script_path) . " Version " . $version . ' ';
+        $cmd='wget -q https://pre.a.wpexpress.de/wp-content/uploads/wpmove/src/wpack.php -O' . $script_path;
         if ($verb >= 2) echo "updating with cmd: $cmd\n";
         shell_exec($cmd);
-        echo " (updated to " . trim(shell_exec(__FILE__ . ' --version')) . ")\n";
+        echo " (updated to " . trim(shell_exec($script_path . ' --version')) . ")\n";
         exit(0);
     }
     if (!isset($archiveFile)) $archiveFile = "wpsfx-" . date('Y-m-d') . ".php";
 
-    $myname = basename(__FILE__);
+    $myname = $my_basename;
     $______ = str_repeat(' ', strlen($myname));
 
     if (isset($options['h'])) {
@@ -3162,31 +3163,33 @@ function __HALT_SFX() {
         mysql_dump();
         echo sprintf_needed_time_memory_peak($t) . "                        \n";
 
-        $fp__FILE__ = fopen(__FILE__, 'rb');
-        // search the __HALT_COMPILER position, the ending here not existing semicolon saves us from finding this comment - as position.
-        $posHaltCompiler = false;
-        while (($line = fgets($fp__FILE__)) !== false) {
-            if (strpos($line, '__HALT_'.'COMPILER();') !== false) {  // the conacatination saves us to match this - as position as well.
-                $posHaltCompiler = ftell($fp__FILE__);
-                break;
-            }
-        }
-        if (false === $posHaltCompiler) {
-            echo "\nFATAL: Could not find the compressed raw data in " . __FILE__ .". Exit 1.\n\n";
-            exit(1);
-        }
-
-        if (!rewind($fp__FILE__)) {
-            echo "\nFATAL: Could not rewind file pointer from " . __FILE__ .". Exit 1.\n\n";
-            exit(1);
-        }
+        // Create SFX header from helper.inc.php content
+        $helperFile = __FILE__;
+        $shebang = "#!/usr/bin/env php\n";
+        // Split the string to avoid this line matching as an actual HALT_COMPILER directive
+        $halt = "\n__HALT_" . "COMPILER();\n";
 
         $archiveStream = fopen($archiveFile, 'wb');
         if (!$archiveStream) {
             echo("\nFATAL: Could not create '$archiveFile'. Exit 1.\n\n");
             exit(1);
         }
-        stream_copy_to_stream( $fp__FILE__, $archiveStream, $posHaltCompiler );
+
+        // Write shebang line
+        fwrite($archiveStream, $shebang);
+
+        // Write helper.inc.php content as SFX header
+        $helperStream = fopen($helperFile, 'rb');
+        if (!$helperStream) {
+            echo "\nFATAL: Could not read '$helperFile'. Exit 1.\n\n";
+            exit(1);
+        }
+        stream_copy_to_stream($helperStream, $archiveStream);
+        fclose($helperStream);
+
+        // Write HALT_COMPILER marker to separate code from archive data
+        fwrite($archiveStream, $halt);
+
         fclose($archiveStream);
         appendArchive($sourceDirectory, $archiveFile);
         chmod($archiveFile, 0744);
@@ -6280,7 +6283,7 @@ function genwpack() {
     global $version;
 
     $input = __FILE__;
-    $output = 'wpack.php';
+    $output = 'wpack-standalone.php';
 
     $shebang = "#!/usr/bin/env php\n";
     $halt = "\n__HALT_"."COMPILER();\n";
