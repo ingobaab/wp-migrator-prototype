@@ -3164,8 +3164,9 @@ function __HALT_SFX() {
         echo sprintf_needed_time_memory_peak($t) . "                        \n";
 
         // Create SFX header from helper.inc.php content
-        $helperFile = __DIR__ . '/helper.inc.php';
+        $helperFile = __FILE__;
         $shebang = "#!/usr/bin/env php\n";
+        // Split the string to avoid this line matching as an actual HALT_COMPILER directive
         $halt = "\n__HALT_" . "COMPILER();\n";
 
         $archiveStream = fopen($archiveFile, 'wb');
